@@ -1,6 +1,6 @@
 /* 英単語帳 Service Worker — アプリシェルをキャッシュしてオフラインで開けるようにする。
    アプリのファイルを更新したら CACHE_VERSION を上げること（古いキャッシュは activate で削除される）。 */
-var CACHE_VERSION = "v1";
+var CACHE_VERSION = "v2";
 var CACHE_NAME = "eitango-shell-" + CACHE_VERSION;
 var SHELL = [
   "./",
@@ -57,17 +57,17 @@ self.addEventListener("fetch", function (event) {
     return;
   }
 
-  // その他: キャッシュがあればすぐ返し、裏で更新する（stale-while-revalidate）
+  // その他（JS/CSS等）: ネットワーク優先で常に最新を取りに行き、成功したらキャッシュも更新。
+  // オフライン時のみキャッシュを返す（stale-while-revalidate だと更新が1回遅れて届くため）。
   event.respondWith(
-    caches.match(req).then(function (cached) {
-      var network = fetch(req).then(function (res) {
-        if (res && res.ok) {
-          var copy = res.clone();
-          caches.open(CACHE_NAME).then(function (c) { c.put(req, copy); });
-        }
-        return res;
-      }).catch(function () { return cached; });
-      return cached || network;
+    fetch(req).then(function (res) {
+      if (res && res.ok) {
+        var copy = res.clone();
+        caches.open(CACHE_NAME).then(function (c) { c.put(req, copy); });
+      }
+      return res;
+    }).catch(function () {
+      return caches.match(req);
     })
   );
 });
