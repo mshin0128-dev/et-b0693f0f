@@ -650,7 +650,7 @@
     document.documentElement.setAttribute("data-theme", effective);
     document.documentElement.style.colorScheme = effective;
     var meta = document.querySelector('meta[name="theme-color"]');
-    if (meta) meta.setAttribute("content", effective === "dark" ? "#2A1E55" : "#5B3FE0");
+    if (meta) meta.setAttribute("content", effective === "dark" ? "#1C1826" : "#FFFFFF");
     Array.prototype.forEach.call($("themeSeg").querySelectorAll(".seg-btn"), function (btn) {
       btn.classList.toggle("active", btn.getAttribute("data-theme-choice") === pref);
     });
@@ -840,6 +840,7 @@
     li.classList.remove("is-open");
     var tw = li.querySelector(".row-text");
     if (tw) tw.setAttribute("aria-expanded", "false");
+    if (wordByNo[li.getAttribute("data-no")]) setRowMeaning(li, wordByNo[li.getAttribute("data-no")], false);
     if (!detail) return;
     detail.classList.remove("open");
     if (reduceMotion()) { detail.remove(); return; }
@@ -856,6 +857,7 @@
     detail.appendChild(inner);
     li.appendChild(detail);
     li.classList.add("is-open");
+    setRowMeaning(li, w, true);
     renderRowDetailBody(inner, w, li);
     if (animate && !reduceMotion()) {
       void detail.offsetWidth; // reflow してから open を付与 → 展開アニメーション
@@ -867,39 +869,6 @@
 
   function renderRowDetailBody(body, w, li) {
     body.innerHTML = "";
-
-    // ヘッダー部分（タップで閉じる）
-    var top = document.createElement("div");
-    top.className = "row-detail-top";
-    top.setAttribute("role", "button");
-    top.setAttribute("tabindex", "0");
-    top.setAttribute("aria-expanded", "true");
-    top.setAttribute("aria-label", w.word + " の詳細を閉じる");
-    top.addEventListener("click", function () { toggleRow(w.no); });
-    top.addEventListener("keydown", function (e) {
-      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggleRow(w.no); }
-    });
-
-    var head = document.createElement("div");
-    head.className = "sheet-head";
-    head.innerHTML = '<span class="w-no">No.' + w.no + '</span><span class="w-pos">' + escapeHtml(w.pos || "") + '</span>';
-    top.appendChild(head);
-
-    var wordRow = document.createElement("div");
-    wordRow.className = "sheet-word-row";
-    wordRow.innerHTML = '<span class="sheet-word">' + escapeHtml(w.word) + '</span>';
-    var sb = buildSpeakBtn(w.word);
-    if (sb) {
-      sb.addEventListener("click", function (e) { e.stopPropagation(); });
-      wordRow.appendChild(sb);
-    }
-    top.appendChild(wordRow);
-
-    var meaning = document.createElement("div");
-    meaning.className = "sheet-meaning";
-    meaning.textContent = w.meaning || "";
-    top.appendChild(meaning);
-    body.appendChild(top);
 
     var tipLine = document.createElement("div");
     tipLine.className = "detail-line";
@@ -914,23 +883,19 @@
       body.appendChild(ex);
     }
 
-    var hist = document.createElement("div");
-    hist.className = "detail-line";
-    hist.innerHTML = '<span class="detail-label">記録</span>' + renderHistoryBlock(w.no);
-    body.appendChild(hist);
+  }
 
-    var label = document.createElement("label");
-    label.className = "check-label";
-    label.innerHTML = '<input type="checkbox"' + (isLearned(w.no) ? " checked" : "") + '>覚えた';
-    label.querySelector("input").addEventListener("change", function (e) {
-      setLearned(w.no, e.target.checked);
-      li.classList.toggle("is-learned", e.target.checked);
-      var rc = li.querySelector('.chk-wrap input');
-      if (rc) rc.checked = e.target.checked;
-      renderListChips();
-      showToast(e.target.checked ? "「" + w.word + "」を覚えた に追加しました" : "「" + w.word + "」のチェックを外しました");
-    });
-    body.appendChild(label);
+  // 行は変えず、意味の行だけ（プレースホルダ ⇄ 意味）切り替える
+  function setRowMeaning(li, w, shown) {
+    var el = li.querySelector(".w-meaning, .w-meaning-placeholder");
+    if (!el) return;
+    if (shown) {
+      el.className = "w-meaning";
+      el.textContent = w.meaning || "";
+    } else {
+      el.className = "w-meaning-placeholder";
+      el.textContent = "タップで意味と詳細を表示";
+    }
   }
 
   $("listSearch").addEventListener("input", function (e) {
@@ -2279,7 +2244,7 @@
   loadProgress();
   reconcileReservedOnLoad();
   applyTheme();
-  $("appbarSub").textContent = ALL_WORDS.length + "語（セット1〜" + RANGES.length + "）";
+  $("appbarSub").textContent = "EITANGO · " + ALL_WORDS.length + " WORDS";
   switchTab("list");
   booted = true; // 起動時の初回表示ではスタッガーしない
   flipBuildDeck();

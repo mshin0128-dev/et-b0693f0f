@@ -9,7 +9,7 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
 <meta name="apple-mobile-web-app-title" content="英単語帳">
 <meta name="format-detection" content="telephone=no">
-<meta name="theme-color" content="#5B3FE0">
+<meta name="theme-color" content="#FFFFFF">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" type="image/png" sizes="192x192" href="icon-192.png">
 <link rel="apple-touch-icon" href="apple-touch-icon.png">
@@ -23,7 +23,7 @@
     document.documentElement.setAttribute('data-theme', effective);
     document.documentElement.style.colorScheme = effective;
     var meta = document.querySelector('meta[name="theme-color"]');
-    if (meta) meta.setAttribute('content', effective === 'dark' ? '#2A1E55' : '#5B3FE0');
+    if (meta) meta.setAttribute('content', effective === 'dark' ? '#1C1826' : '#FFFFFF');
   } catch (e) {
     document.documentElement.setAttribute('data-theme', 'light');
   }

@@ -80,23 +80,32 @@ button, a, input, select, textarea, label { touch-action: manipulation; }
 }
 
 .appbar {
-  padding: calc(16px + var(--safe-t)) 16px 18px;
-  background: linear-gradient(135deg, var(--grad-a), var(--grad-b));
-  color: #fff;
-  border-radius: 0 0 20px 20px;
-  box-shadow: var(--shadow);
+  --appbar-bg: linear-gradient(180deg, #FFFFFF 0%, #F8F6FD 100%);
+  --appbar-border: #E6E1F0;
+  --appbar-ghost-hover: rgba(91,63,224,0.08);
+  padding: calc(14px + var(--safe-t)) 20px 14px;
+  background: var(--appbar-bg);
+  color: var(--text);
+  border-bottom: 1px solid var(--appbar-border);
 }
-.appbar-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+html[data-theme="dark"] .appbar {
+  --appbar-bg: linear-gradient(180deg, #1C1826 0%, #181421 100%);
+  --appbar-border: rgba(255,255,255,0.08);
+  --appbar-ghost-hover: rgba(165,140,255,0.14);
+}
+.appbar-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .appbar-text { flex: 1; }
-.appbar h1 { margin: 0; font-size: 20px; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.appbar p { margin: 4px 0 0; font-size: 13px; }
+.appbar h1 { margin: 0; font-size: 18px; font-weight: 600; letter-spacing: 0.14em; line-height: 1.3; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.appbar p { margin: 3px 0 0; font-size: 11px; font-weight: 600; letter-spacing: 0.2em; text-transform: uppercase; color: var(--sub); line-height: 1.3; }
 .appbar .icon-btn {
-  flex: none; width: 40px; height: 40px; border-radius: 14px;
-  display: grid; place-items: center; color: #fff;
-  background: rgba(255,255,255,0.22); border: none; padding: 0; margin: 0;
+  flex: none; width: 40px; height: 40px; border-radius: 12px;
+  display: grid; place-items: center; color: var(--sub);
+  background: transparent; border: 1px solid transparent; padding: 0; margin: 0;
+  transition: background-color .2s ease, color .2s ease, border-color .2s ease;
 }
-.appbar .icon-btn svg { width: 20px; height: 20px; }
-.appbar .icon-btn[aria-pressed="true"] { background: rgba(255,255,255,0.38); }
+.appbar .icon-btn:hover { background: var(--appbar-ghost-hover); color: var(--accent); }
+.appbar .icon-btn svg { width: 20px; height: 20px; stroke-width: 1.8; }
+.appbar .icon-btn[aria-pressed="true"] { background: var(--appbar-ghost-hover); color: var(--accent); border-color: var(--appbar-border); }
 
 .view { display: none; padding: 16px; }
 .view.active { display: block; }
@@ -437,17 +446,12 @@ li.word-row { transition: background-color .25s ease; }
 .toast:empty { display: none; }
 
 /* 7. 単語の詳細（一覧の行内展開） */
-li.word-row.is-open > .row-main { display: none; }
 .row-detail { display: grid; grid-template-rows: 0fr; opacity: 0; transition: grid-template-rows .3s var(--ease-out), opacity .25s ease; }
 .row-detail.open { grid-template-rows: 1fr; opacity: 1; }
 .row-detail-inner { min-height: 0; overflow: hidden; padding: 0 14px; }
-.row-detail.open .row-detail-inner { padding: 10px 14px 16px; }
-.row-detail-top { cursor: pointer; margin-bottom: 12px; }
-.sheet-head { display: flex; align-items: baseline; gap: 8px; }
-.sheet-word-row { display: flex; align-items: center; gap: 10px; margin: 4px 0 2px; }
-.sheet-word { font-size: clamp(26px, 8vw, 34px); font-weight: 800; }
-.sheet-meaning { font-size: 20px; font-weight: 700; margin: 4px 0 0; }
+.row-detail.open .row-detail-inner { padding: 10px 14px 14px; border-top: 1px solid var(--border); }
 .row-detail .detail-line { margin-bottom: 12px; }
+.row-detail .detail-line:last-child { margin-bottom: 0; }
 
 /* 8. めくりカードのスプリング遷移 */
 @keyframes card-in-next { from { opacity: 0; transform: translateX(44px) rotate(2deg); } to { opacity: 1; transform: none; } }
