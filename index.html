@@ -9,7 +9,10 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
 <meta name="apple-mobile-web-app-title" content="英単語帳">
 <meta name="format-detection" content="telephone=no">
-<meta name="theme-color" content="#7C5CFF">
+<meta name="theme-color" content="#5B3FE0">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" type="image/png" sizes="192x192" href="icon-192.png">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
 <script>
 (function () {
   try {
@@ -20,7 +23,7 @@
     document.documentElement.setAttribute('data-theme', effective);
     document.documentElement.style.colorScheme = effective;
     var meta = document.querySelector('meta[name="theme-color"]');
-    if (meta) meta.setAttribute('content', effective === 'dark' ? '#2A1E55' : '#7C5CFF');
+    if (meta) meta.setAttribute('content', effective === 'dark' ? '#2A1E55' : '#5B3FE0');
   } catch (e) {
     document.documentElement.setAttribute('data-theme', 'light');
   }
@@ -47,6 +50,10 @@
   </header>
 
   <section class="view active" id="view-list">
+    <div class="card mb" id="homeCard">
+      <div id="homeStats"></div>
+      <button type="button" class="btn primary block review-btn" id="reviewBtn">今日の復習<span id="reviewCount"></span></button>
+    </div>
     <h2 class="view-title">単語一覧</h2>
     <div class="chip-row" id="listRangeChips"></div>
     <div class="search-wrap">
@@ -101,11 +108,23 @@
   <section class="view" id="view-test">
     <h2 class="view-title">テスト</h2>
     <div id="testSetup">
+      <div class="card mb" id="reviewCard">
+        <div class="review-info" id="reviewInfo"></div>
+        <button type="button" class="btn block" id="reviewToggleBtn">今日の復習モード</button>
+      </div>
       <div class="field">
+        <label class="field-label">形式</label>
+        <div class="seg" id="testFormatSeg">
+          <button type="button" class="seg-btn" data-format="input">英→日 入力</button>
+          <button type="button" class="seg-btn" data-format="jaen">日→英 入力</button>
+          <button type="button" class="seg-btn" data-format="cloze">例文穴埋め</button>
+        </div>
+      </div>
+      <div class="field" id="testRangeField">
         <label class="field-label">範囲</label>
         <div class="chip-row" id="testRangeChips"></div>
       </div>
-      <div class="field">
+      <div class="field" id="testTargetField">
         <label class="field-label">対象</label>
         <div class="seg" id="testTargetSeg">
           <button type="button" class="seg-btn" data-target="unchecked">未チェックだけ</button>
@@ -116,7 +135,7 @@
         <label class="field-label">出題数</label>
         <div class="chip-row" id="testCountChips"></div>
       </div>
-      <div class="card mb">
+      <div class="card mb" id="testCycleCard">
         <div class="cycle-status" id="testCycleStatus" style="margin:0 0 10px;"></div>
         <button type="button" class="btn block danger" id="cycleResetBtn">周回をリセット</button>
       </div>
@@ -153,6 +172,7 @@
 
   <section class="view" id="view-progress">
     <h2 class="view-title">進み具合</h2>
+    <div class="card mb" id="progStats"></div>
     <div class="card mb">
       <div class="bar-row" style="margin-bottom:0;">
         <div class="bar-label"><span class="nm">全体の習得</span><span class="vv" id="progOverallText">0 / 500</span></div>
@@ -198,15 +218,24 @@
     <div class="card mb">
       <div class="settings-row">
         <div>
-          <div class="st-label">学習記録を書き出す</div>
-          <div class="st-desc">現在の記録をJSONファイルとして保存します</div>
+          <div class="st-label">1日の目標語数</div>
+          <div class="st-desc">今日の学習語数と比べる目標（1〜500語）</div>
+        </div>
+        <input type="number" id="goalInput" class="goal-input" min="1" max="500" step="1" inputmode="numeric" aria-label="1日の目標語数">
+      </div>
+    </div>
+    <div class="card mb">
+      <div class="settings-row">
+        <div>
+          <div class="st-label">進捗を書き出す</div>
+          <div class="st-desc">保存されている進捗すべてをJSONファイルとしてダウンロードします</div>
         </div>
         <button type="button" class="btn" id="exportBtn">書き出す</button>
       </div>
       <div class="settings-row">
         <div>
-          <div class="st-label">学習記録を読み込む</div>
-          <div class="st-desc">保存したJSONファイルから記録を復元します</div>
+          <div class="st-label">進捗を読み込む</div>
+          <div class="st-desc">書き出したJSONファイルから進捗を復元します（今の進捗は置き換わります）</div>
         </div>
         <label class="file-label" for="importFile">読み込む</label>
         <input type="file" id="importFile" accept="application/json" style="display:none;">
