@@ -436,36 +436,18 @@ li.word-row { transition: background-color .25s ease; }
 .toast.show { opacity: 1; transform: translate(-50%, 0); }
 .toast:empty { display: none; }
 
-/* 7. ボトムシート（単語の詳細） */
-.sheet-backdrop {
-  position: fixed; inset: 0; z-index: 300; background: rgba(18, 16, 24, .5);
-  opacity: 0; transition: opacity .3s ease;
-}
-.sheet-backdrop.open { opacity: 1; }
-.sheet {
-  position: fixed; left: 0; right: 0; bottom: 0; z-index: 301; margin: 0 auto; max-width: 600px;
-  max-height: 86vh; max-height: 86dvh; display: flex; flex-direction: column;
-  background: var(--card); border: 1px solid var(--border); border-bottom: none;
-  border-radius: 24px 24px 0 0; box-shadow: 0 -10px 32px rgba(31, 26, 46, .2);
-  padding-bottom: var(--safe-b);
-  transform: translateY(105%); transition: transform .4s var(--ease-out);
-}
-.sheet.open { transform: none; }
-.sheet-grab { position: relative; flex: none; height: 34px; touch-action: none; }
-.sheet-handle { position: absolute; top: 10px; left: 50%; width: 40px; height: 5px; margin-left: -20px; border-radius: 3px; background: var(--border); }
-html[data-theme="dark"] .sheet-handle { background: rgba(255, 255, 255, .22); }
-.sheet-close {
-  position: absolute; top: 2px; right: 10px; width: 40px; height: 40px; border-radius: 14px; border: none; padding: 0;
-  display: grid; place-items: center; background: var(--learned-bg); color: var(--sub);
-}
-.sheet-close svg { width: 18px; height: 18px; }
-.sheet-body { flex: 1; overflow-y: auto; overscroll-behavior: contain; padding: 4px 18px 22px; }
+/* 7. 単語の詳細（一覧の行内展開） */
+li.word-row.is-open > .row-main { display: none; }
+.row-detail { display: grid; grid-template-rows: 0fr; opacity: 0; transition: grid-template-rows .3s var(--ease-out), opacity .25s ease; }
+.row-detail.open { grid-template-rows: 1fr; opacity: 1; }
+.row-detail-inner { min-height: 0; overflow: hidden; padding: 0 14px; }
+.row-detail.open .row-detail-inner { padding: 10px 14px 16px; }
+.row-detail-top { cursor: pointer; margin-bottom: 12px; }
 .sheet-head { display: flex; align-items: baseline; gap: 8px; }
 .sheet-word-row { display: flex; align-items: center; gap: 10px; margin: 4px 0 2px; }
 .sheet-word { font-size: clamp(26px, 8vw, 34px); font-weight: 800; }
-.sheet-meaning { font-size: 20px; font-weight: 700; margin: 4px 0 14px; }
-.sheet-body .detail-line { margin-bottom: 12px; }
-body.sheet-open { overflow: hidden; }
+.sheet-meaning { font-size: 20px; font-weight: 700; margin: 4px 0 0; }
+.row-detail .detail-line { margin-bottom: 12px; }
 
 /* 8. めくりカードのスプリング遷移 */
 @keyframes card-in-next { from { opacity: 0; transform: translateX(44px) rotate(2deg); } to { opacity: 1; transform: none; } }

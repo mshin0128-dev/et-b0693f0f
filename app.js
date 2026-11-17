@@ -665,7 +665,7 @@
   // ---------- 画面状態 / タブ ----------
   var state = {
     tab: "list",
-    list: { range: RANGES[0], query: "", sheetNo: null },
+    list: { range: RANGES[0], query: "", openNo: null },
     flip: { range: RANGES[0], shuffle: false, unlearnedOnly: false, deck: [], index: 0, flipped: false },
     test: {
       phase: "setup",
@@ -804,9 +804,10 @@
       textWrap.setAttribute("role", "button");
       textWrap.setAttribute("tabindex", "0");
       textWrap.setAttribute("aria-label", w.word + " の詳細を開く");
-      textWrap.addEventListener("click", function () { openSheet(w.no, textWrap); });
+      textWrap.setAttribute("aria-expanded", "false");
+      textWrap.addEventListener("click", function () { toggleRow(w.no); });
       textWrap.addEventListener("keydown", function (e) {
-        if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openSheet(w.no, textWrap); }
+        if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggleRow(w.no); }
       });
 
       main.appendChild(chkWrap);
@@ -816,50 +817,93 @@
       li.appendChild(main);
 
       ul.appendChild(li);
+      if (state.list.openNo === w.no) showRowDetail(li, w, false);
     });
   }
 
-  $("listSearch").addEventListener("input", function (e) {
-    state.list.query = e.target.value;
-    renderList();
-  });
+  // ---------- 単語詳細（行内展開） ----------
+  function rowByNo(no) { return $("listWords").querySelector('li[data-no="' + no + '"]'); }
 
-  // ---------- 単語詳細ボトムシート ----------
-  var sheetTrigger = null, sheetTimer = null;
-  function setBackgroundInert(on) {
-    ["app", "tabbar"].forEach(function (id) {
-      var el = $(id);
-      if (!el) return;
-      if (on) el.setAttribute("inert", ""); else el.removeAttribute("inert");
-    });
+  function toggleRow(no) {
+    var prev = state.list.openNo;
+    state.list.tipEdit = null;
+    if (prev != null) hideRowDetail(rowByNo(prev));
+    if (prev === no) { state.list.openNo = null; return; }
+    state.list.openNo = no;
+    var li = rowByNo(no);
+    if (li) showRowDetail(li, wordByNo[no], true);
   }
 
-  function renderSheetBody() {
-    var w = wordByNo[state.list.sheetNo];
-    var body = $("sheetBody");
+  function hideRowDetail(li) {
+    if (!li) return;
+    var detail = li.querySelector(".row-detail");
+    li.classList.remove("is-open");
+    var tw = li.querySelector(".row-text");
+    if (tw) tw.setAttribute("aria-expanded", "false");
+    if (!detail) return;
+    detail.classList.remove("open");
+    if (reduceMotion()) { detail.remove(); return; }
+    setTimeout(function () { if (!li.classList.contains("is-open") && detail.parentNode) detail.remove(); }, 300);
+  }
+
+  function showRowDetail(li, w, animate) {
+    var old = li.querySelector(".row-detail");
+    if (old) old.remove();
+    var detail = document.createElement("div");
+    detail.className = "row-detail";
+    var inner = document.createElement("div");
+    inner.className = "row-detail-inner";
+    detail.appendChild(inner);
+    li.appendChild(detail);
+    li.classList.add("is-open");
+    renderRowDetailBody(inner, w, li);
+    if (animate && !reduceMotion()) {
+      void detail.offsetWidth; // reflow してから open を付与 → 展開アニメーション
+    }
+    detail.classList.add("open");
+    var tw = li.querySelector(".row-text");
+    if (tw) tw.setAttribute("aria-expanded", "true");
+  }
+
+  function renderRowDetailBody(body, w, li) {
     body.innerHTML = "";
-    if (!w) return;
+
+    // ヘッダー部分（タップで閉じる）
+    var top = document.createElement("div");
+    top.className = "row-detail-top";
+    top.setAttribute("role", "button");
+    top.setAttribute("tabindex", "0");
+    top.setAttribute("aria-expanded", "true");
+    top.setAttribute("aria-label", w.word + " の詳細を閉じる");
+    top.addEventListener("click", function () { toggleRow(w.no); });
+    top.addEventListener("keydown", function (e) {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggleRow(w.no); }
+    });
 
     var head = document.createElement("div");
     head.className = "sheet-head";
     head.innerHTML = '<span class="w-no">No.' + w.no + '</span><span class="w-pos">' + escapeHtml(w.pos || "") + '</span>';
-    body.appendChild(head);
+    top.appendChild(head);
 
     var wordRow = document.createElement("div");
     wordRow.className = "sheet-word-row";
     wordRow.innerHTML = '<span class="sheet-word">' + escapeHtml(w.word) + '</span>';
     var sb = buildSpeakBtn(w.word);
-    if (sb) wordRow.appendChild(sb);
-    body.appendChild(wordRow);
+    if (sb) {
+      sb.addEventListener("click", function (e) { e.stopPropagation(); });
+      wordRow.appendChild(sb);
+    }
+    top.appendChild(wordRow);
 
     var meaning = document.createElement("div");
     meaning.className = "sheet-meaning";
     meaning.textContent = w.meaning || "";
-    body.appendChild(meaning);
+    top.appendChild(meaning);
+    body.appendChild(top);
 
     var tipLine = document.createElement("div");
     tipLine.className = "detail-line";
-    renderTipBlockInto(tipLine, w.no, state.list, renderSheetBody);
+    renderTipBlockInto(tipLine, w.no, state.list, function () { renderRowDetailBody(body, w, li); });
     body.appendChild(tipLine);
 
     if (w.example) {
@@ -880,93 +924,19 @@
     label.innerHTML = '<input type="checkbox"' + (isLearned(w.no) ? " checked" : "") + '>覚えた';
     label.querySelector("input").addEventListener("change", function (e) {
       setLearned(w.no, e.target.checked);
-      var row = $("listWords").querySelector('li[data-no="' + w.no + '"]');
-      if (row) {
-        row.classList.toggle("is-learned", e.target.checked);
-        var rc = row.querySelector('.chk-wrap input');
-        if (rc) rc.checked = e.target.checked;
-      }
+      li.classList.toggle("is-learned", e.target.checked);
+      var rc = li.querySelector('.chk-wrap input');
+      if (rc) rc.checked = e.target.checked;
       renderListChips();
       showToast(e.target.checked ? "「" + w.word + "」を覚えた に追加しました" : "「" + w.word + "」のチェックを外しました");
     });
     body.appendChild(label);
   }
 
-  function openSheet(no, trigger) {
-    var sheet = $("sheet"), backdrop = $("sheetBackdrop");
-    state.list.sheetNo = no;
-    state.list.tipEdit = null;
-    sheetTrigger = trigger || null;
-    renderSheetBody();
-    $("sheetBody").scrollTop = 0;
-    clearTimeout(sheetTimer);
-    sheet.style.transform = "";
-    sheet.hidden = false;
-    backdrop.hidden = false;
-    void sheet.offsetWidth; // hidden解除直後に reflow してからクラス付与 → スライドアップ
-    sheet.classList.add("open");
-    backdrop.classList.add("open");
-    document.body.classList.add("sheet-open");
-    setBackgroundInert(true);
-    try { $("sheetClose").focus({ preventScroll: true }); } catch (e) {}
-  }
-
-  function closeSheet() {
-    if (state.list.sheetNo == null) return;
-    var sheet = $("sheet"), backdrop = $("sheetBackdrop");
-    state.list.sheetNo = null;
-    state.list.tipEdit = null;
-    sheet.style.transition = "";
-    sheet.style.transform = "";
-    sheet.classList.remove("open");
-    backdrop.classList.remove("open");
-    document.body.classList.remove("sheet-open");
-    setBackgroundInert(false);
-    if (sheetTrigger && document.body.contains(sheetTrigger)) {
-      try { sheetTrigger.focus({ preventScroll: true }); } catch (e) {}
-    }
-    sheetTrigger = null;
-    clearTimeout(sheetTimer);
-    sheetTimer = setTimeout(function () {
-      if (state.list.sheetNo != null) return; // 閉じている間に開き直された
-      sheet.hidden = true;
-      backdrop.hidden = true;
-    }, reduceMotion() ? 0 : 420);
-  }
-
-  $("sheetClose").addEventListener("click", closeSheet);
-  $("sheetBackdrop").addEventListener("click", closeSheet);
-  document.addEventListener("keydown", function (e) {
-    if (e.key === "Escape" && state.list.sheetNo != null) closeSheet();
+  $("listSearch").addEventListener("input", function (e) {
+    state.list.query = e.target.value;
+    renderList();
   });
-
-  // ハンドルを下にドラッグして閉じる（指に追従するのは動きを減らす設定がオフの時だけ）
-  (function sheetDrag() {
-    var grab = $("sheetGrab"), sheet = $("sheet");
-    var sy = 0, dy = 0, dragging = false;
-    grab.addEventListener("touchstart", function (e) {
-      if (!e.touches[0]) return;
-      sy = e.touches[0].clientY; dy = 0; dragging = true;
-    }, { passive: true });
-    grab.addEventListener("touchmove", function (e) {
-      if (!dragging || !e.touches[0]) return;
-      dy = Math.max(0, e.touches[0].clientY - sy);
-      if (!reduceMotion()) {
-        sheet.style.transition = "none";
-        sheet.style.transform = "translateY(" + dy + "px)";
-      }
-    }, { passive: true });
-    function end() {
-      if (!dragging) return;
-      dragging = false;
-      sheet.style.transition = "";
-      if (dy > 90) { closeSheet(); }
-      else { sheet.style.transform = ""; }
-      dy = 0;
-    }
-    grab.addEventListener("touchend", end, { passive: true });
-    grab.addEventListener("touchcancel", end, { passive: true });
-  })();
 
   // ---------- めくる ----------
   function renderFlipChips(animate) {
