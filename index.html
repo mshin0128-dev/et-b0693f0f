@@ -98,6 +98,7 @@
     </div>
     <div class="flip-learned-row">
       <label class="check-label"><input type="checkbox" id="flipLearnedChk">覚えた</label>
+      <button type="button" class="star-btn flip-star" id="flipStarBtn" aria-pressed="false"></button>
     </div>
     <div class="flip-nav">
       <button type="button" class="btn block" id="flipPrevBtn">前へ</button>
@@ -129,6 +130,7 @@
         <div class="seg" id="testTargetSeg">
           <button type="button" class="seg-btn" data-target="unchecked">未チェックだけ</button>
           <button type="button" class="seg-btn" data-target="all">全部（チェック済みも含む）</button>
+          <button type="button" class="seg-btn" data-target="flagged" id="testFlaggedBtn">★フラグのみ</button>
         </div>
       </div>
       <div class="field">
@@ -246,7 +248,7 @@
       <div class="settings-row">
         <div>
           <div class="st-label">記録リセット</div>
-          <div class="st-desc">学習記録をすべて消して最初の状態に戻します（テーマ設定と覚え方の編集内容は残ります）</div>
+          <div class="st-desc">学習記録をすべて消して最初の状態に戻します（テーマ設定・覚え方の編集内容・★フラグは残ります）</div>
         </div>
         <button type="button" class="btn danger" id="resetBtn">リセット</button>
       </div>

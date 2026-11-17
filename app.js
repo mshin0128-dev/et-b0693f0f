@@ -31,7 +31,7 @@
   ALL_WORDS.forEach(function (w) { wordByNo[w.no] = w; });
 
   var DEFAULT_DAILY_GOAL = 20;
-  var progress = { learned: {}, history: {}, sessions: [], cycles: {}, tips: {}, days: {}, settings: { dailyGoal: DEFAULT_DAILY_GOAL } };
+  var progress = { learned: {}, history: {}, sessions: [], cycles: {}, tips: {}, days: {}, settings: { dailyGoal: DEFAULT_DAILY_GOAL }, flags: {}, srs: {} };
 
   function $(id) { return document.getElementById(id); }
   function hasOwn(o, k) { return Object.prototype.hasOwnProperty.call(o, k); }
@@ -197,7 +197,88 @@
     if (saved.settings && typeof saved.settings === "object" && typeof saved.settings.dailyGoal === "number" && isFinite(saved.settings.dailyGoal)) {
       goal = Math.max(1, Math.min(500, Math.round(saved.settings.dailyGoal)));
     }
-    return { learned: learned, history: history, sessions: sessions, cycles: cycles, tips: tips, days: days, settings: { dailyGoal: goal }, migrations: {} };
+    // ★フラグ: { 単語番号: true }
+    var flags = {};
+    var sf = (saved.flags && typeof saved.flags === "object" && !Array.isArray(saved.flags)) ? saved.flags : {};
+    Object.keys(sf).forEach(function (k) { if (sf[k] === true && wordByNo[k]) flags[k] = true; });
+    // 間隔反復: { 単語番号: { stage, due, last, pending, prev? } }。保存に無い語は履歴から遅延初期化する。
+    var srs = normalizeSrs(saved.srs, history, sessions);
+    return { learned: learned, history: history, sessions: sessions, cycles: cycles, tips: tips, days: days, settings: { dailyGoal: goal }, flags: flags, srs: srs, migrations: {} };
+  }
+
+  // ---------- 間隔反復（忘却曲線） ----------
+  var SRS_INTERVAL_DAYS = [1, 2, 4, 7, 14, 30]; // stage 0..5
+  var DAY_MS = 86400000;
+  var JST_OFFSET_MS = 9 * 3600000;
+  function srsIntervalMs(stage) { return SRS_INTERVAL_DAYS[Math.max(0, Math.min(5, stage | 0))] * DAY_MS; }
+  // 今日(東京時間)の終わり。これ以前が期限の語は「今日の復習」対象。
+  function endOfTodayMs(now) {
+    return (Math.floor((now + JST_OFFSET_MS) / DAY_MS) + 1) * DAY_MS - JST_OFFSET_MS;
+  }
+  function finiteNum(v) { return (typeof v === "number" && isFinite(v)) ? v : null; }
+  function normalizeSrs(savedSrs, history, sessions) {
+    var ss = (savedSrs && typeof savedSrs === "object" && !Array.isArray(savedSrs)) ? savedSrs : {};
+    var out = {}, now = Date.now();
+    // 旧データ用: 語ごとの最終テスト時刻をセッション記録から求める
+    var lastAt = null;
+    ALL_WORDS.forEach(function (w) {
+      var e = hasOwn(ss, w.no) ? ss[w.no] : null;
+      if (e && typeof e === "object") {
+        var stage = finiteNum(e.stage), due = finiteNum(e.due);
+        if (stage !== null && due !== null) {
+          var o = { stage: Math.max(0, Math.min(5, Math.round(stage))), due: due, last: finiteNum(e.last) || 0, pending: !!e.pending };
+          if (e.prev && typeof e.prev === "object" && finiteNum(e.prev.stage) !== null && finiteNum(e.prev.due) !== null) {
+            o.prev = { stage: Math.max(0, Math.min(5, Math.round(e.prev.stage))), due: e.prev.due, last: finiteNum(e.prev.last) || 0, pending: !!e.prev.pending, none: !!e.prev.none };
+          }
+          out[w.no] = o;
+          return;
+        }
+      }
+      var h = history[w.no];
+      if (!h) return; // 未テストの語は対象外
+      if (!lastAt) {
+        lastAt = {};
+        sessions.forEach(function (s) {
+          var t = s.at ? Date.parse(s.at) : NaN;
+          if (isNaN(t) || !Array.isArray(s.items)) return;
+          s.items.forEach(function (it) { if (it && typeof it.no === "number" && (!lastAt[it.no] || t > lastAt[it.no])) lastAt[it.no] = t; });
+        });
+      }
+      var wrong = h.charAt(h.length - 1) === "×";
+      var streak = 0;
+      for (var i = h.length - 1; i >= 0 && h.charAt(i) === "○"; i--) streak++;
+      var stg = wrong ? 0 : Math.min(5, streak);
+      var last = lastAt[w.no] || null;
+      // 日付が分かれば「最終テスト + 間隔」、分からなければ今すぐ期限
+      out[w.no] = { stage: stg, due: last ? last + srsIntervalMs(stg) : now, last: last || 0, pending: wrong };
+    });
+    return out;
+  }
+  function srsSnapshot(e) { return e ? { stage: e.stage, due: e.due, last: e.last, pending: e.pending } : { none: true, stage: 0, due: 0, last: 0, pending: false }; }
+  function srsApply(no, correct, now) {
+    var e = progress.srs[no];
+    var prev = srsSnapshot(e);
+    var stage = e ? e.stage : 0;
+    if (correct) {
+      stage = Math.min(5, stage + 1);
+      progress.srs[no] = { stage: stage, due: now + srsIntervalMs(stage), last: now, pending: false, prev: prev };
+    } else {
+      progress.srs[no] = { stage: 0, due: now + srsIntervalMs(0), last: now, pending: true, prev: prev };
+    }
+  }
+  // 手動で判定を変えた時: 直前の更新を巻き戻して、新しい判定で更新し直す
+  function srsRevise(no, correct) {
+    var e = progress.srs[no];
+    if (e && e.prev) {
+      if (e.prev.none) delete progress.srs[no];
+      else progress.srs[no] = { stage: e.prev.stage, due: e.prev.due, last: e.prev.last, pending: e.prev.pending };
+    }
+    srsApply(no, correct, e && e.last ? e.last : Date.now());
+  }
+  function isSrsDue(no, now) {
+    var e = progress.srs && progress.srs[no];
+    if (!e || !getHistory(no)) return false; // 一度もテストしていない語は含めない
+    return e.pending || e.due <= endOfTodayMs(now);
   }
 
   function loadProgress() {
@@ -239,6 +320,7 @@
   }
   function appendHistory(no, mark) {
     progress.history[no] = getHistory(no) + mark;
+    srsApply(no, mark !== "×", Date.now());
     noteStudied(no);
     saveProgress();
     renderStudyStats();
@@ -259,8 +341,29 @@
     var g = progress.settings && progress.settings.dailyGoal;
     return (typeof g === "number" && g >= 1) ? g : DEFAULT_DAILY_GOAL;
   }
+  // 今日の復習 = (a) 最新の記録が× + (b) 復習期限が今日以前でテスト済みの語（未テストの語は含めない）
   function reviewNos() {
-    return ALL_WORDS.filter(function (w) { return getHistory(w.no).slice(-1) === "×"; }).map(function (w) { return w.no; });
+    var now = Date.now();
+    return ALL_WORDS.filter(function (w) {
+      return getHistory(w.no).slice(-1) === "×" || isSrsDue(w.no, now);
+    }).map(function (w) { return w.no; });
+  }
+  function isFlagged(no) { return !!(progress.flags && progress.flags[no]); }
+  function setFlagged(no, on) {
+    if (!progress.flags) progress.flags = {};
+    if (on) progress.flags[no] = true; else delete progress.flags[no];
+    saveProgress();
+  }
+  function flaggedNosInRange() {
+    return wordsForRangeKey(normalizeRangeKeyForCycle()).filter(function (w) { return isFlagged(w.no); }).map(function (w) { return w.no; });
+  }
+  var STAR_SVG = '<svg viewBox="0 0 24 24" stroke-width="2" stroke-linejoin="round" aria-hidden="true"><path d="M12 2.8l2.8 5.9 6.4.8-4.7 4.4 1.2 6.4L12 17.2 6.3 20.3l1.2-6.4L2.8 9.5l6.4-.8z"></path></svg>';
+  function syncStarBtn(btn, no, withLabel) {
+    var on = isFlagged(no);
+    btn.classList.toggle("on", on);
+    btn.setAttribute("aria-pressed", String(on));
+    btn.setAttribute("aria-label", (on ? "★フラグを外す: " : "★フラグを付ける: ") + (wordByNo[no] ? wordByNo[no].word : ""));
+    btn.innerHTML = STAR_SVG + (withLabel ? "<span>" + (on ? "フラグ済み" : "フラグ") + "</span>" : "");
   }
 
   function studyStatsHtml() {
@@ -281,11 +384,12 @@
     h.innerHTML = html;
     p.innerHTML = html;
     var cnt = $("reviewCount");
-    if (cnt) cnt.textContent = "（×の単語 " + reviewNos().length + "語）";
+    if (cnt) cnt.textContent = "（" + reviewNos().length + "語）";
   }
   function rewriteLastHistoryMark(no, mark) {
     var h = getHistory(no);
     progress.history[no] = h.length ? h.slice(0, -1) + mark : mark;
+    srsRevise(no, mark !== "×");
     saveProgress();
   }
 
@@ -672,6 +776,7 @@
       selectedRanges: [RANGES[0]],
       allRanges: false,
       unlearnedOnly: true,
+      flaggedOnly: false,   // ★フラグのみ（true の間は周回を使わない）
       count: 20,
       format: "input", runFormat: "input", review: false,
       activeCycleKey: null, activeCycleLap: null,
@@ -814,6 +919,18 @@
       main.appendChild(textWrap);
       var sb = buildSpeakBtn(w.word);
       if (sb) main.appendChild(sb);
+      var star = document.createElement("button");
+      star.type = "button";
+      star.className = "star-btn";
+      syncStarBtn(star, w.no, false);
+      star.addEventListener("click", function (e) {
+        e.stopPropagation();
+        var on = !isFlagged(w.no);
+        setFlagged(w.no, on);
+        syncStarBtn(star, w.no, false);
+        showToast(on ? "「" + w.word + "」に★を付けました" : "「" + w.word + "」の★を外しました");
+      });
+      main.appendChild(star);
       li.appendChild(main);
 
       ul.appendChild(li);
@@ -952,12 +1069,15 @@
       back.hidden = true;
       chk.checked = false;
       chk.disabled = true;
+      $("flipStarBtn").style.display = "none";
       $("flipBackTipWrap").innerHTML = "";
       $("flipBackHistory").innerHTML = "";
       return;
     }
     if (state.flip.tipEdit && state.flip.tipEdit.no !== w.no) state.flip.tipEdit = null;
     chk.disabled = false;
+    $("flipStarBtn").style.display = "";
+    syncStarBtn($("flipStarBtn"), w.no, true);
     $("flipFrontNo").textContent = "No." + w.no + " ・ " + (w.pos || "");
     $("flipFrontWord").textContent = w.word;
     var fs = $("flipFrontSpeakWrap"); fs.innerHTML = "";
@@ -1051,6 +1171,14 @@
     setLearned(w.no, e.target.checked);
     showToast(e.target.checked ? "「" + w.word + "」を覚えた に追加しました" : "「" + w.word + "」のチェックを外しました");
   });
+  $("flipStarBtn").addEventListener("click", function () {
+    var w = currentFlipWord();
+    if (!w) return;
+    var on = !isFlagged(w.no);
+    setFlagged(w.no, on);
+    syncStarBtn($("flipStarBtn"), w.no, true);
+    showToast(on ? "「" + w.word + "」に★を付けました" : "「" + w.word + "」の★を外しました");
+  });
   $("flipShuffleBtn").addEventListener("click", function (e) {
     state.flip.shuffle = !state.flip.shuffle;
     e.currentTarget.textContent = "シャッフル: " + (state.flip.shuffle ? "オン" : "オフ");
@@ -1123,9 +1251,12 @@
       rwrap.appendChild(chip);
     });
 
+    var curTarget = state.test.flaggedOnly ? "flagged" : (state.test.unlearnedOnly ? "unchecked" : "all");
     Array.prototype.forEach.call($("testTargetSeg").querySelectorAll(".seg-btn"), function (btn) {
-      btn.classList.toggle("active", (btn.getAttribute("data-target") === "unchecked") === state.test.unlearnedOnly);
+      btn.classList.toggle("active", btn.getAttribute("data-target") === curTarget);
     });
+    var flaggedN = flaggedNosInRange().length;
+    $("testFlaggedBtn").textContent = "★フラグのみ（" + flaggedN + "）";
 
     Array.prototype.forEach.call($("testFormatSeg").querySelectorAll(".seg-btn"), function (btn) {
       btn.classList.toggle("active", btn.getAttribute("data-format") === state.test.format);
@@ -1133,10 +1264,14 @@
     var review = state.test.review, rn = reviewNos().length;
     $("testRangeField").style.display = review ? "none" : "";
     $("testTargetField").style.display = review ? "none" : "";
-    $("testCycleCard").style.display = review ? "none" : "";
+    var flaggedMode = !review && state.test.flaggedOnly;
+    $("testCycleCard").style.display = (review || flaggedMode) ? "none" : "";
     $("reviewInfo").innerHTML = review
-      ? '<b>今日の復習モード</b>: 最新の記録が×の単語 ' + rn + '語から出題します（全セット対象）。'
-      : '最新の記録が×の単語: <b>' + rn + '語</b>（全セット対象）';
+      ? '<b>今日の復習モード</b>: ×の単語と復習期限が来た単語 ' + rn + '語から出題します（全セット対象）。'
+      : '今日の復習（×の単語＋期限が来た単語）: <b>' + rn + '語</b>（全セット対象）';
+    var noFlagged = flaggedMode && flaggedN === 0;
+    $("testStartBtn").disabled = noFlagged;
+    if (noFlagged) showSetupMessage("この範囲に★フラグの付いた単語がありません。一覧やめくる画面で★を付けてください。");
     $("reviewToggleBtn").textContent = review ? "通常のテストに戻す" : "今日の復習モードにする";
     $("reviewToggleBtn").className = "btn block" + (review ? "" : " primary");
     $("testStartBtn").textContent = review ? "復習テストを始める" : "テストを始める";
@@ -1158,7 +1293,9 @@
   $("testTargetSeg").addEventListener("click", function (e) {
     var btn = e.target.closest(".seg-btn");
     if (!btn) return;
-    state.test.unlearnedOnly = btn.getAttribute("data-target") === "unchecked";
+    var t = btn.getAttribute("data-target");
+    state.test.flaggedOnly = t === "flagged";
+    state.test.unlearnedOnly = t === "unchecked";
     renderTestSetup();
   });
   $("cycleResetBtn").addEventListener("click", function () {
@@ -1177,14 +1314,14 @@
 
   // 今日の復習: 最新の記録が×の単語を全セットから集めて出題（周回には影響させない）
   function setReviewMode(on) {
-    if (on && !reviewNos().length) { state.test.review = false; showToast("復習する単語はありません（×の単語がありません）"); renderTestSetup(); return false; }
+    if (on && !reviewNos().length) { state.test.review = false; showToast("今日復習する単語はありません"); renderTestSetup(); return false; }
     state.test.review = !!on;
     renderTestSetup();
     return true;
   }
   $("reviewToggleBtn").addEventListener("click", function () { setReviewMode(!state.test.review); });
   $("reviewBtn").addEventListener("click", function () {
-    if (!reviewNos().length) { showToast("復習する単語はありません（×の単語がありません）"); return; }
+    if (!reviewNos().length) { showToast("今日復習する単語はありません"); return; }
     if (state.test.phase === "inputTest" || loadInputDraft()) {
       showToast("途中のテストがあります。先にそのテストを終えてください");
       switchTab("test");
@@ -1202,7 +1339,7 @@
       state.test.review = false;
       state.test.phase = "setup";
       renderTestSetup();
-      showToast("復習する単語はありません（×の単語がありません）");
+      showToast("今日復習する単語はありません");
       return;
     }
     var chosen = shuffle(pool).slice(0, state.test.count);
@@ -1213,6 +1350,19 @@
 
   function handleStartClick() {
     if (state.test.review) { startReviewTest(); return; }
+    if (state.test.flaggedOnly) {
+      // ★フラグのみ: 範囲内のフラグ付き語からランダムに出題（周回には影響させない）
+      var flagged = flaggedNosInRange();
+      if (!flagged.length) {
+        state.test.phase = "setup";
+        renderTestSetup();
+        return;
+      }
+      state.test.activeCycleKey = null;
+      state.test.activeCycleLap = null;
+      startInputTest(shuffle(flagged).slice(0, state.test.count).map(function (no) { return wordByNo[no]; }).filter(Boolean));
+      return;
+    }
     var key = currentCycleKey();
     var mode = cycleModeFromKey(key);
     var freshPool = poolNosForKey(key);
@@ -1457,6 +1607,7 @@
         review: !!state.test.review,
         ranges: state.test.allRanges ? ["ALL"] : state.test.selectedRanges.slice(),
         unlearnedOnly: state.test.unlearnedOnly,
+        flaggedOnly: !!state.test.flaggedOnly,
         count: state.test.count
       },
       activeCycleKey: state.test.activeCycleKey,
@@ -1496,6 +1647,7 @@
       if (rs && rs.indexOf("ALL") !== -1) { state.test.allRanges = true; state.test.selectedRanges = []; }
       else if (rs && rs.length) { state.test.allRanges = false; state.test.selectedRanges = rs.slice(); }
       if (typeof draft.settings.unlearnedOnly === "boolean") state.test.unlearnedOnly = draft.settings.unlearnedOnly;
+      state.test.flaggedOnly = draft.settings.flaggedOnly === true;
       if (draft.settings.count) state.test.count = draft.settings.count;
     }
     state.test.activeCycleKey = draft.activeCycleKey || null;
@@ -2128,6 +2280,8 @@
     if (hasOwn(p, "cycles") && !isPlainObject(p.cycles)) return "cycles";
     if (hasOwn(p, "tips") && !isPlainObject(p.tips)) return "tips";
     if (hasOwn(p, "days") && !isPlainObject(p.days)) return "days";
+    if (hasOwn(p, "flags") && !isPlainObject(p.flags)) return "flags";
+    if (hasOwn(p, "srs") && !isPlainObject(p.srs)) return "srs";
     if (hasOwn(p, "settings") && !isPlainObject(p.settings)) return "settings";
     return null;
   }
@@ -2179,7 +2333,7 @@
   $("resetBtn").addEventListener("click", function () {
     if (!window.confirm("学習記録をすべて消して最初の状態に戻します。よろしいですか？")) return;
     var keptTips = progress.tips;
-    progress = normalizeProgress({ tips: keptTips, settings: progress.settings });
+    progress = normalizeProgress({ tips: keptTips, settings: progress.settings, flags: progress.flags });
     saveProgress();
     clearInputDraft();
     state.test.phase = "setup";

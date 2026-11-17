@@ -311,6 +311,18 @@ html[data-theme="dark"] .cal-cell.is-selected .cal-dot { background: #1C1826; }
 }
 .speak-btn svg { width: 17px; height: 17px; flex: none; }
 
+/* ★フラグ: 未設定は枠線のみ、設定済みは塗りつぶし（--close を流用） */
+.star-btn {
+  flex: none; width: 36px; height: 36px; min-height: 0; border-radius: 10px;
+  border: 1px solid var(--border); background: var(--card); color: var(--sub);
+  display: inline-flex; align-items: center; justify-content: center; padding: 0;
+}
+.star-btn svg { width: 18px; height: 18px; flex: none; fill: none; stroke: currentColor; }
+.star-btn.on { color: var(--close); border-color: var(--close); }
+.star-btn.on svg { fill: currentColor; }
+.star-btn.flip-star { width: auto; padding: 0 12px; gap: 6px; height: 44px; font-size: 14px; font-weight: 600; }
+.seg-btn:disabled { opacity: .5; }
+
 ul.session-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
 li.session-item { border: 1px solid var(--border); border-radius: 12px; padding: 10px 12px; }
 .session-main-wrap { cursor: pointer; }
