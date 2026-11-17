@@ -124,6 +124,8 @@ h2.view-title.sub { font-size: 15px; }
 .card.mb { margin-bottom: 16px; }
 
 .chip-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 12px; width: 100%; }
+#testCountChips { grid-template-columns: repeat(5, 1fr); }
+#testCountChips .chip { min-height: 48px; }
 .chip {
   border: 1px solid var(--border);
   background: var(--card);
