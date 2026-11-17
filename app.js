@@ -1,433 +1,2018 @@
-/* 英単語帳 — アプリ本体。ビルド不要、file:// で動作。 */
-(() => {
-  'use strict';
+/* 英単語帳 — アプリ本体。ビルド不要。TOEIC単語帳 の機能（一覧 / めくる / テスト / 進み具合 / 設定）を 500語・5セット向けに再構成。 */
+(function () {
+  "use strict";
 
-  const TOTAL_SETS = 5;
-  const SET_SIZE = 100;
-  const TEST_LEN = 10;
-  const KEY = 'eitango:v1';
+  // ---------- 定数 ----------
+  var PROGRESS_KEY = "eitango_progress_v1";
+  var THEME_KEY = "eitango_theme_pref";
+  var DRAFT_KEY = "eitango_input_draft_v1";
+  var OPENAI_KEY = "wayaku_openai_key"; // TOEIC単語帳と共有（キーを1回入れれば両方で使える）
+  var OPENAI_MODEL = "gpt-6-luna";      // 参照アプリの値をそのまま使用。変更はここだけ。
+  var TEST_COUNT_OPTIONS = [10, 20, 30, 40, 50];
+  var RANGES = ["001-100", "101-200", "201-300", "301-400", "401-500"]; // セット1〜5
 
-  /* ---------- データ ---------- */
-  const bySet = {};
-  for (let s = 1; s <= TOTAL_SETS; s++) bySet[s] = WORDS.filter(w => w.set === s);
-  const hasData = s => bySet[s].length > 0;
-  const wid = w => w.set + ':' + w.word;
-  const byId = new Map(WORDS.map(w => [wid(w), w]));
+  function rangeLabel(r) { return "セット" + (RANGES.indexOf(r) + 1); }
+  function rangeChipInner(r, rest) {
+    return "<b>" + rangeLabel(r) + '</b><span class="rest">No.' + r + '</span><span class="rest">' + rest + "</span>";
+  }
 
-  /* ---------- 保存 ---------- */
-  const isObj = v => v && typeof v === 'object' && !Array.isArray(v);
-  function normalize(d) {
-    d = isObj(d) ? d : {};
+  // words.js は `const WORDS`（window のプロパティではない）なので識別子として参照する。
+  var SOURCE_WORDS = (typeof WORDS !== "undefined" && Array.isArray(WORDS)) ? WORDS : [];
+  var ALL_WORDS = SOURCE_WORDS.map(function (w, i) {
+    var no = i + 1;
+    var setNo = (w.set | 0) >= 1 && (w.set | 0) <= RANGES.length ? (w.set | 0) : Math.ceil(no / 100);
     return {
-      learned: isObj(d.learned) ? d.learned : {},
-      wrong: isObj(d.wrong) ? d.wrong : {},
-      results: Array.isArray(d.results) ? d.results : [],
+      no: no, set: setNo, range: RANGES[setNo - 1],
+      word: w.word, pos: w.pos, meaning: w.meaning,
+      example: w.example || "", exampleJa: w.exampleJa || "", hint: w.hint || ""
     };
+  });
+  var wordByNo = {};
+  ALL_WORDS.forEach(function (w) { wordByNo[w.no] = w; });
+
+  var progress = { learned: {}, history: {}, sessions: [], cycles: {}, tips: {} };
+
+  function $(id) { return document.getElementById(id); }
+  function hasOwn(o, k) { return Object.prototype.hasOwnProperty.call(o, k); }
+
+  function escapeHtml(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
   }
-  let storageOk = true;
-  function load() {
-    try {
-      const raw = localStorage.getItem(KEY);
-      if (raw) return normalize(JSON.parse(raw));
-    } catch (e) { storageOk = false; }
-    return normalize({});
-  }
-  const state = load();
-  function save() {
-    try { localStorage.setItem(KEY, JSON.stringify(state)); storageOk = true; }
-    catch (e) { storageOk = false; }
-    document.getElementById('notice').hidden = storageOk;
-  }
-  document.getElementById('notice').hidden = storageOk;
 
-  /* ---------- 集計 ---------- */
-  const learnedIn = s => bySet[s].filter(w => state.learned[wid(w)]).length;
-  const learnedAll = () => WORDS.filter(w => state.learned[wid(w)]).length;
-  const wrongWords = () => Object.keys(state.wrong).map(id => byId.get(id)).filter(Boolean);
-  const setResults = s => state.results.filter(r => r.set === s);
-  const fmtDate = iso => { const d = new Date(iso); return isNaN(d) ? '' : (d.getMonth() + 1) + '/' + d.getDate(); };
-
-  /* ---------- ユーティリティ ---------- */
-  const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-  const shuffle = a => { a = a.slice(); for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; };
-  const pct = (n, d) => d ? Math.round((n / d) * 100) : 0;
-  const bar = (n, d) => `<div class="bar" role="progressbar" aria-valuemin="0" aria-valuemax="${d}" aria-valuenow="${n}"><i style="width:${pct(n, d)}%"></i></div>`;
-  const svg = p => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${p}</svg>`;
-  const ICON = {
-    back: svg('<path d="M15 5l-7 7 7 7"/>'),
-    next: svg('<path d="M9 5l7 7-7 7"/>'),
-    check: svg('<path d="M5 12.5l4.5 4.5L19 7.5"/>'),
-    cross: svg('<path d="M6 6l12 12M18 6L6 18"/>'),
-  };
-  const posLabel = w => w.pos;
-
-  /* ---------- 状態（メモリ上） ---------- */
-  let study = null;   // {set, deck, i, flipped, filter}
-  let session = null; // テスト中の状態
-
-  /* ---------- ルーティング ---------- */
-  const app = document.getElementById('app');
-  const go = hash => { if (location.hash === hash) render(); else location.hash = hash; };
-  const route = () => {
-    const [, name, arg] = location.hash.split('/');
-    return { name: name || 'home', set: parseInt(arg, 10) };
-  };
-
-  function render() {
-    const r = route();
-    let html = '', focusSel = '[data-title]';
-    if (r.name === 'study' && r.set >= 1 && r.set <= TOTAL_SETS && hasData(r.set)) {
-      if (!study || study.set !== r.set) startStudy(r.set);
-      html = viewStudy();
-    } else if (r.name === 'test' && session && session.kind === 'set' && session.set === r.set) {
-      ({ html, focusSel } = viewTest());
-    } else if (r.name === 'retest' && session && session.kind === 'retest') {
-      ({ html, focusSel } = viewTest());
-    } else if (r.name === 'wrong') {
-      html = viewWrong();
-    } else {
-      if (r.name !== 'home') { history.replaceState(null, '', location.pathname + location.search); }
-      html = viewHome();
+  function shuffle(arr) {
+    var a = arr.slice();
+    for (var i = a.length - 1; i > 0; i--) {
+      var j = Math.floor(Math.random() * (i + 1));
+      var t = a[i]; a[i] = a[j]; a[j] = t;
     }
-    app.innerHTML = html;
-    const f = app.querySelector(focusSel) || app.querySelector('[data-title]');
-    if (f) f.focus({ preventScroll: true });
+    return a;
+  }
+
+  // ---------- モーション共通 ----------
+  function reduceMotion() {
+    return !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+  }
+
+  // トースト（画面下部の小さな通知）
+  var toastTimer = null;
+  function showToast(msg) {
+    var el = $("toast");
+    if (!el) return;
+    el.textContent = msg;
+    void el.offsetWidth;
+    el.classList.add("show");
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { el.classList.remove("show"); }, 2200);
+  }
+
+  // リップル（押した位置から広がる）: 主ボタン・選択ボタン・タブ
+  var RIPPLE_SEL = ".btn.primary, .chip, .seg-btn, .tab-btn";
+  document.addEventListener("pointerdown", function (e) {
+    if (reduceMotion() || (e.button != null && e.button > 0)) return;
+    var el = e.target && e.target.closest ? e.target.closest(RIPPLE_SEL) : null;
+    if (!el || el.disabled) return;
+    var r = el.getBoundingClientRect();
+    var size = Math.max(r.width, r.height) * 2.2;
+    var s = document.createElement("span");
+    s.className = "ripple";
+    s.style.width = s.style.height = size + "px";
+    s.style.left = (e.clientX - r.left - size / 2) + "px";
+    s.style.top = (e.clientY - r.top - size / 2) + "px";
+    el.appendChild(s);
+    var remove = function () { if (s.parentNode) s.parentNode.removeChild(s); };
+    s.addEventListener("animationend", remove);
+    setTimeout(remove, 900);
+  });
+
+  // チェックボックスのポップ
+  document.addEventListener("change", function (e) {
+    var t = e.target;
+    if (reduceMotion() || !t || t.type !== "checkbox" || !t.checked) return;
+    t.classList.remove("chk-pop");
+    void t.offsetWidth;
+    t.classList.add("chk-pop");
+    t.addEventListener("animationend", function () { t.classList.remove("chk-pop"); }, { once: true });
+  });
+
+  // 紙吹雪（ライブラリなし。transform/opacity のみのアニメ）
+  var CONFETTI_COLORS = ["var(--accent)", "#8A6CFF", "var(--good)", "var(--close)", "var(--danger)"];
+  function launchConfetti() {
+    if (reduceMotion()) return;
+    var wrap = document.createElement("div");
+    wrap.className = "confetti";
+    wrap.setAttribute("aria-hidden", "true");
+    for (var i = 0; i < 44; i++) {
+      var p = document.createElement("i");
+      p.style.setProperty("--x", (Math.random() * 100).toFixed(1) + "%");
+      p.style.setProperty("--w", (6 + Math.random() * 6).toFixed(1) + "px");
+      p.style.setProperty("--c", CONFETTI_COLORS[i % CONFETTI_COLORS.length]);
+      p.style.setProperty("--dx", (Math.random() * 160 - 80).toFixed(0) + "px");
+      p.style.setProperty("--r", (360 + Math.random() * 540).toFixed(0) + "deg");
+      p.style.setProperty("--d", (1.8 + Math.random() * 1.1).toFixed(2) + "s");
+      p.style.setProperty("--delay", (Math.random() * 0.45).toFixed(2) + "s");
+      wrap.appendChild(p);
+    }
+    document.body.appendChild(wrap);
+    setTimeout(function () { if (wrap.parentNode) wrap.parentNode.removeChild(wrap); }, 3800);
+  }
+
+  // ボタンのローディング状態（短いスピナーを見せてから実行）
+  function runWithLoading(btn, fn) {
+    if (reduceMotion() || !btn) { fn(); return; }
+    if (btn.classList.contains("is-loading")) return;
+    btn.classList.add("is-loading");
+    btn.disabled = true;
+    btn.setAttribute("aria-busy", "true");
+    setTimeout(function () {
+      btn.classList.remove("is-loading");
+      btn.disabled = false;
+      btn.removeAttribute("aria-busy");
+      fn();
+    }, 320);
+  }
+
+  // ---------- 保存 / 読み込み ----------
+  var lastSaveOk = true;
+  function showStorageNotice(show) {
+    var el = $("notice");
+    if (el) el.hidden = !show;
+  }
+
+  function saveProgress() {
+    try {
+      localStorage.setItem(PROGRESS_KEY, JSON.stringify(progress));
+      showStorageNotice(false);
+      lastSaveOk = true;
+    } catch (e) {
+      showStorageNotice(true);
+      lastSaveOk = false;
+    }
+  }
+
+  function numList(v) {
+    return (Array.isArray(v) ? v : []).filter(function (n) { return typeof n === "number" && wordByNo[n]; });
+  }
+
+  function normalizeProgress(saved) {
+    saved = (saved && typeof saved === "object") ? saved : {};
+    var sl = (saved.learned && typeof saved.learned === "object") ? saved.learned : {};
+    var sh = (saved.history && typeof saved.history === "object") ? saved.history : {};
+    var st = (saved.tips && typeof saved.tips === "object") ? saved.tips : {};
+    var learned = {}, history = {}, tips = {};
+    ALL_WORDS.forEach(function (w) {
+      learned[w.no] = hasOwn(sl, w.no) ? !!sl[w.no] : false;
+      history[w.no] = hasOwn(sh, w.no) ? String(sh[w.no] || "").replace(/[^○×]/g, "") : "";
+      if (hasOwn(st, w.no) && typeof st[w.no] === "string" && st[w.no] !== w.hint) tips[w.no] = st[w.no];
+    });
+    var cycles = {};
+    var sc = (saved.cycles && typeof saved.cycles === "object") ? saved.cycles : {};
+    Object.keys(sc).forEach(function (key) {
+      var c = sc[key];
+      if (!c || typeof c !== "object") return;
+      cycles[key] = {
+        lap: (typeof c.lap === "number" && c.lap >= 1) ? c.lap : 1,
+        remaining: numList(c.remaining),
+        wrongLap: numList(c.wrongLap),
+        reserved: numList(c.reserved),
+        everStarted: !!c.everStarted,
+        lapTotal: (typeof c.lapTotal === "number" && c.lapTotal > 0) ? c.lapTotal : undefined
+      };
+    });
+    var sessions = (Array.isArray(saved.sessions) ? saved.sessions : []).filter(function (s) {
+      return s && typeof s === "object";
+    });
+    return { learned: learned, history: history, sessions: sessions, cycles: cycles, tips: tips, migrations: {} };
+  }
+
+  function loadProgress() {
+    var raw = null;
+    try { raw = localStorage.getItem(PROGRESS_KEY); } catch (e) { raw = null; }
+    var parsed = null;
+    if (raw) { try { parsed = JSON.parse(raw); } catch (e) { parsed = null; } }
+    progress = normalizeProgress(parsed);
+    saveProgress();
+  }
+
+  function reconcileReservedOnLoad() {
+    var draft = loadInputDraft();
+    var keepKey = draft ? draft.activeCycleKey : null;
+    var keepNos = {};
+    if (draft && Array.isArray(draft.questions)) draft.questions.forEach(function (q) { keepNos[q.no] = true; });
+    var changed = false;
+    Object.keys(progress.cycles).forEach(function (key) {
+      var c = progress.cycles[key];
+      if (!c.reserved.length) return;
+      var still = [];
+      c.reserved.forEach(function (no) {
+        if (key === keepKey && keepNos[no]) still.push(no);
+        else { changed = true; if (c.remaining.indexOf(no) === -1) c.remaining.push(no); }
+      });
+      c.reserved = still;
+    });
+    if (changed) saveProgress();
+  }
+
+  // ---------- 単語ごとの状態 ----------
+  function isLearned(no) { return !!progress.learned[no]; }
+  function getHistory(no) { return progress.history[no] || ""; }
+  function setLearned(no, val) { progress.learned[no] = !!val; saveProgress(); }
+  function appendHistory(no, mark) { progress.history[no] = getHistory(no) + mark; saveProgress(); }
+  function rewriteLastHistoryMark(no, mark) {
+    var h = getHistory(no);
+    progress.history[no] = h.length ? h.slice(0, -1) + mark : mark;
+    saveProgress();
+  }
+
+  function addSession(session) {
+    progress.sessions.push(session);
+    saveProgress();
+    return session;
+  }
+  function makeSessionId() {
+    return "app-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
+  }
+  function sessionRangesFromNos(nos) {
+    var seen = {}, out = [];
+    nos.forEach(function (no) {
+      var w = wordByNo[no];
+      if (w && !seen[w.range]) { seen[w.range] = true; out.push(w.range); }
+    });
+    return out;
+  }
+
+  function renderHistoryBlock(no) {
+    var h = getHistory(no);
+    if (!h) return '<div class="hist-wrap"><span class="hist-none">まだ記録なし</span></div>';
+    var chars = "", good = 0, miss = 0;
+    for (var i = 0; i < h.length; i++) {
+      if (h.charAt(i) === "○") { good++; chars += '<span class="hist-good">○</span>'; }
+      else { miss++; chars += '<span class="hist-bad">×</span>'; }
+    }
+    var acc = Math.round((good / h.length) * 100);
+    return '<div class="hist-wrap"><div class="hist-str">' + chars + '</div>' +
+      '<div class="hist-stats">×' + miss + '回 ・ 正答率' + acc + '%</div></div>';
+  }
+
+  // ---------- 覚え方（hint）の編集 ----------
+  function getOriginalTip(no) { var w = wordByNo[no]; return (w && w.hint) || ""; }
+  function getEffectiveTip(no) { return hasOwn(progress.tips, no) ? progress.tips[no] : getOriginalTip(no); }
+  function setTipOverride(no, value) {
+    delete progress.tips[no];
+    if (value !== getOriginalTip(no)) progress.tips[no] = value;
+    saveProgress();
+  }
+  function clearTipOverride(no) { delete progress.tips[no]; saveProgress(); }
+
+  function renderTipBlockInto(container, no, holder, onChange) {
+    container.innerHTML = "";
+    container.onclick = function (e) { e.stopPropagation(); };
+    var effective = getEffectiveTip(no);
+    var editingState = holder.tipEdit;
+    var editing = !!(editingState && editingState.no === no);
+
+    var labelRow = document.createElement("div");
+    labelRow.className = "tip-label-row";
+    var label = document.createElement("span");
+    label.className = "detail-label";
+    label.textContent = "覚え方";
+    labelRow.appendChild(label);
+
+    if (editing) {
+      container.appendChild(labelRow);
+      var ta = document.createElement("textarea");
+      ta.className = "tip-textarea";
+      ta.value = editingState.draft;
+      ta.setAttribute("aria-label", "覚え方を編集");
+      ta.addEventListener("click", function (e) { e.stopPropagation(); });
+      ta.addEventListener("pointerdown", function (e) { e.stopPropagation(); });
+      ta.addEventListener("input", function () { editingState.draft = ta.value; });
+      container.appendChild(ta);
+      if (editingState.focus) {
+        editingState.focus = false;
+        setTimeout(function () { ta.focus(); }, 0);
+      }
+      var btnRow = document.createElement("div");
+      btnRow.className = "tip-btn-row";
+      var saveBtn = document.createElement("button");
+      saveBtn.type = "button"; saveBtn.className = "btn primary"; saveBtn.textContent = "保存";
+      saveBtn.addEventListener("click", function (e) {
+        e.stopPropagation();
+        setTipOverride(no, ta.value);
+        holder.tipEdit = null;
+        showToast("覚え方を保存しました");
+        onChange();
+      });
+      var revertBtn = document.createElement("button");
+      revertBtn.type = "button"; revertBtn.className = "btn"; revertBtn.textContent = "元に戻す";
+      revertBtn.addEventListener("click", function (e) {
+        e.stopPropagation();
+        clearTipOverride(no);
+        holder.tipEdit = null;
+        showToast("覚え方を元に戻しました");
+        onChange();
+      });
+      btnRow.appendChild(saveBtn);
+      btnRow.appendChild(revertBtn);
+      container.appendChild(btnRow);
+      setTimeout(function () { if (btnRow.scrollIntoView) btnRow.scrollIntoView({ block: "nearest", inline: "nearest" }); }, 0);
+    } else {
+      var startEdit = function (e) {
+        e.stopPropagation();
+        holder.tipEdit = { no: no, draft: effective, focus: true };
+        onChange();
+      };
+      var editBtn = document.createElement("button");
+      editBtn.type = "button"; editBtn.className = "tip-edit-btn"; editBtn.textContent = "編集";
+      editBtn.addEventListener("click", startEdit);
+      labelRow.appendChild(editBtn);
+      container.appendChild(labelRow);
+      var p = document.createElement("p");
+      if (effective) { p.className = "tip-display"; p.textContent = effective; }
+      else { p.className = "tip-display tip-placeholder"; p.textContent = "タップして覚え方を書く"; }
+      p.addEventListener("click", startEdit);
+      container.appendChild(p);
+    }
+  }
+
+  function wordsInRange(range) {
+    if (range === "ALL") return ALL_WORDS;
+    return ALL_WORDS.filter(function (w) { return w.range === range; });
+  }
+  function rangeRemaining(range) {
+    return wordsInRange(range).filter(function (w) { return !isLearned(w.no); }).length;
+  }
+
+  // ---------- 発音（Web Speech API） ----------
+  var SPEAK_ICON_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+    '<path d="M4 9v6h4l5 4V5L8 9H4z"></path><path d="M16.3 8.7a5 5 0 0 1 0 6.6"></path><path d="M19 6a8.5 8.5 0 0 1 0 12"></path></svg>';
+
+  function supportsSpeech() {
+    return !!(window.speechSynthesis && typeof window.speechSynthesis.speak === "function" && window.SpeechSynthesisUtterance);
+  }
+  function pickEnglishVoice(voices) {
+    if (!voices || !voices.length) return null;
+    var exact = voices.filter(function (v) { return v.lang === "en-US"; });
+    if (exact.length) return exact[0];
+    var en = voices.filter(function (v) { return /^en/i.test(v.lang || ""); });
+    return en.length ? en[0] : null;
+  }
+  function speakWord(word) {
+    if (!supportsSpeech() || !word) return;
+    try {
+      window.speechSynthesis.cancel();
+      var utter = new SpeechSynthesisUtterance(word);
+      utter.lang = "en-US";
+      var voice = pickEnglishVoice(typeof window.speechSynthesis.getVoices === "function" ? window.speechSynthesis.getVoices() : []);
+      if (voice) utter.voice = voice;
+      window.speechSynthesis.speak(utter);
+    } catch (e) {}
+  }
+  function buildSpeakBtn(word) {
+    if (!supportsSpeech()) return null;
+    var btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "speak-btn";
+    btn.setAttribute("aria-label", "発音を再生: " + word);
+    btn.innerHTML = SPEAK_ICON_SVG;
+    btn.addEventListener("click", function (e) { e.stopPropagation(); speakWord(word); });
+    return btn;
+  }
+
+  // ---------- 周回（Cycle） ----------
+  function cycleTake(remaining, n) {
+    var arr = Array.isArray(remaining) ? remaining : [];
+    var count = Math.max(0, n | 0);
+    return { taken: arr.slice(0, count), leftover: arr.slice(count) };
+  }
+
+  function normalizeRangeKeyForCycle() {
+    if (state.test.allRanges) return "ALL";
+    var sorted = state.test.selectedRanges.slice().sort();
+    if (sorted.length === RANGES.length && RANGES.every(function (r) { return sorted.indexOf(r) !== -1; })) return "ALL";
+    return sorted.join(",");
+  }
+  function currentCycleKey() {
+    return normalizeRangeKeyForCycle() + "|" + (state.test.unlearnedOnly ? "unchecked" : "all");
+  }
+  function wordsForRangeKey(rangeKey) {
+    if (rangeKey === "ALL") return ALL_WORDS.slice();
+    var seen = {}, out = [];
+    rangeKey.split(",").forEach(function (r) {
+      wordsInRange(r).forEach(function (w) { if (!seen[w.no]) { seen[w.no] = true; out.push(w); } });
+    });
+    return out;
+  }
+  function cycleModeFromKey(key) { return key.slice(key.lastIndexOf("|") + 1); }
+  function poolNosForKey(key) {
+    var rangeKey = key.slice(0, key.lastIndexOf("|"));
+    var words = wordsForRangeKey(rangeKey);
+    if (cycleModeFromKey(key) === "unchecked") words = words.filter(function (w) { return !isLearned(w.no); });
+    return words.map(function (w) { return w.no; });
+  }
+
+  function getCycle(key) {
+    if (!progress.cycles[key]) progress.cycles[key] = { lap: 1, remaining: [], wrongLap: [], reserved: [], everStarted: false };
+    var c = progress.cycles[key];
+    if (!Array.isArray(c.remaining)) c.remaining = [];
+    if (!Array.isArray(c.wrongLap)) c.wrongLap = [];
+    if (!Array.isArray(c.reserved)) c.reserved = [];
+    if (typeof c.lap !== "number" || c.lap < 1) c.lap = 1;
+    if (typeof c.everStarted !== "boolean") c.everStarted = !!(c.remaining.length || c.wrongLap.length || c.reserved.length || c.lap > 1);
+    return c;
+  }
+
+  function pruneForUnchecked(c, mode, freshPoolNos) {
+    if (mode !== "unchecked") return;
+    var poolSet = {};
+    freshPoolNos.forEach(function (no) { poolSet[no] = true; });
+    c.remaining = c.remaining.filter(function (no) { return poolSet[no]; });
+    c.wrongLap = c.wrongLap.filter(function (no) { return poolSet[no]; });
+  }
+  function advanceLapIfPossible(c, mode, freshPoolNos) {
+    pruneForUnchecked(c, mode, freshPoolNos);
+    var guard = 0;
+    while (c.everStarted && c.remaining.length === 0 && c.reserved.length === 0 && freshPoolNos.length > 0 && guard < 20) {
+      guard++;
+      c.lap = (c.lap || 1) + 1;
+      c.wrongLap = [];
+      c.remaining = shuffle(freshPoolNos);
+      c.lapTotal = c.remaining.length;
+      pruneForUnchecked(c, mode, freshPoolNos);
+    }
+  }
+  function startNewLapIfEmpty(c, mode, freshPoolNos) {
+    advanceLapIfPossible(c, mode, freshPoolNos);
+    if (c.remaining.length === 0 && c.reserved.length === 0 && c.wrongLap.length === 0 && freshPoolNos.length > 0) {
+      c.lap = 1;
+      c.remaining = shuffle(freshPoolNos);
+      c.everStarted = true;
+      c.lapTotal = c.remaining.length;
+    }
+  }
+  function lapTotalForCycle(c, key) {
+    if (typeof c.lapTotal === "number" && c.lapTotal > 0) return { total: c.lapTotal, reliable: true };
+    if ((c.lap || 1) === 1 && cycleModeFromKey(key) === "all") {
+      return { total: wordsForRangeKey(key.slice(0, key.lastIndexOf("|"))).length, reliable: true };
+    }
+    return { total: c.remaining.length + c.reserved.length + c.wrongLap.length, reliable: false };
+  }
+  function cycleStatusInfo(key) {
+    var freshPool = poolNosForKey(key);
+    var c = progress.cycles[key];
+    var remaining = c ? c.remaining.length : 0;
+    var reserved = c ? c.reserved.length : 0;
+    var info = {
+      poolSize: freshPool.length,
+      everStarted: !!(c && c.everStarted),
+      lap: c ? c.lap : 1,
+      remaining: remaining, reserved: reserved,
+      wrong: c ? c.wrongLap.length : 0,
+      z: remaining + reserved,
+      lapTotal: 0, lapTotalReliable: false, tested: 0
+    };
+    if (c) {
+      var t = lapTotalForCycle(c, key);
+      info.lapTotal = t.total;
+      info.lapTotalReliable = t.reliable;
+      info.tested = Math.max(0, t.total - info.z);
+    }
+    return info;
+  }
+  function cycleGroupHtml(info, heading) {
+    var lines = ['<div class="range-sub-heading">' + escapeHtml(heading) + '</div>'];
+    if (info.poolSize === 0) {
+      lines.push('<div class="range-sub-row">対象の単語がありません</div>');
+    } else if (!info.everStarted) {
+      lines.push('<div class="range-sub-row">今の周回: <b>0周目</b>（' + info.poolSize + '語が対象）</div>');
+    } else {
+      lines.push('<div class="range-sub-row">今の周回: <b>' + info.lap + '周目</b></div>');
+      lines.push('<div class="range-sub-row">テスト済み: <b>' + info.tested + (info.lapTotalReliable ? ' / ' + info.lapTotal : '') + '語</b>（残り' + info.z + '語）</div>');
+      lines.push('<div class="range-sub-row">この周の×: <b>' + info.wrong + '語</b></div>');
+    }
+    return lines.join("");
+  }
+  function reconcileCycleAfterTest(key, confirmedNos, wrongNos, unansweredNos) {
+    if (!key) return;
+    var c = getCycle(key);
+    var removeSet = {};
+    confirmedNos.concat(unansweredNos).forEach(function (no) { removeSet[no] = true; });
+    c.reserved = c.reserved.filter(function (no) { return !removeSet[no]; });
+    unansweredNos.forEach(function (no) { if (c.remaining.indexOf(no) === -1) c.remaining.push(no); });
+    wrongNos.forEach(function (no) { if (c.wrongLap.indexOf(no) === -1) c.wrongLap.push(no); });
+    advanceLapIfPossible(c, cycleModeFromKey(key), poolNosForKey(key));
+    saveProgress();
+  }
+  function adjustCycleForVerdictChange(key, lap, no, wasWrong, isWrong) {
+    if (!key || wasWrong === isWrong) return;
+    var c = progress.cycles[key];
+    if (!c || c.lap !== lap) return;
+    if (wasWrong && !isWrong) {
+      var idx = c.wrongLap.indexOf(no);
+      if (idx !== -1) c.wrongLap.splice(idx, 1);
+    } else if (c.wrongLap.indexOf(no) === -1) {
+      c.wrongLap.push(no);
+    }
+    saveProgress();
+  }
+
+  // ---------- 採点 ----------
+  var BRACKET_RE = /\([^)]*\)|（[^）]*）|\[[^\]]*\]|【[^】]*】|「[^」]*」/g;
+  var SYMBOL_RE = /[\s。．.、，,;；:：・\/／ー'"\[\]「」（）()【】-]/g;
+  var TRAILING_SUFFIXES = ["すること", "する", "的", "の", "な", "に"];
+  var MEANING_SPLIT_RE = /[、,;；／\/]/;
+
+  function normalizeAnswer(s) {
+    if (s == null) return "";
+    s = String(s).replace(BRACKET_RE, "").normalize("NFKC");
+    s = s.replace(/[ァ-ヶ]/g, function (ch) { return String.fromCharCode(ch.charCodeAt(0) - 0x60); });
+    s = s.toLowerCase().replace(SYMBOL_RE, "");
+    var changed = true;
+    while (changed) {
+      changed = false;
+      for (var i = 0; i < TRAILING_SUFFIXES.length; i++) {
+        var suf = TRAILING_SUFFIXES[i];
+        if (s.length > suf.length && s.slice(s.length - suf.length) === suf) {
+          s = s.slice(0, s.length - suf.length);
+          changed = true;
+          break;
+        }
+      }
+    }
+    return s;
+  }
+  function bigramsOf(s) {
+    var arr = [];
+    for (var i = 0; i < s.length - 1; i++) arr.push(s.slice(i, i + 2));
+    return arr;
+  }
+  function diceCoefficient(a, b) {
+    var ba = bigramsOf(a), bb = bigramsOf(b);
+    if (!ba.length || !bb.length) return 0;
+    var counts = {}, matches = 0;
+    ba.forEach(function (g) { counts[g] = (counts[g] || 0) + 1; });
+    bb.forEach(function (g) { if (counts[g] > 0) { matches++; counts[g]--; } });
+    return (2 * matches) / (ba.length + bb.length);
+  }
+  function splitMeaningSynonyms(meaning) {
+    return String(meaning == null ? "" : meaning).split(MEANING_SPLIT_RE)
+      .map(normalizeAnswer).filter(function (p) { return p !== ""; });
+  }
+  function gradeAnswer(answer, meaning) {
+    var norm = normalizeAnswer(answer);
+    if (!norm) return { verdict: "wrong" };
+    var syns = splitMeaningSynonyms(meaning);
+    if (syns.indexOf(norm) !== -1) return { verdict: "correct" };
+    if (norm === normalizeAnswer(meaning)) return { verdict: "correct" };
+    for (var i = 0; i < syns.length; i++) {
+      var syn = syns[i];
+      if (norm.length >= 2 && syn.length >= 2 && (syn.indexOf(norm) !== -1 || norm.indexOf(syn) !== -1)) return { verdict: "correct" };
+    }
+    var maxDice = 0;
+    syns.forEach(function (syn) { var d = diceCoefficient(norm, syn); if (d > maxDice) maxDice = d; });
+    return { verdict: maxDice >= 0.6 ? "close" : "wrong" };
+  }
+
+  // ---------- テーマ ----------
+  function readThemePref() { try { return localStorage.getItem(THEME_KEY) || "auto"; } catch (e) { return "auto"; } }
+  function effectiveTheme(pref) {
+    if (pref === "light" || pref === "dark") return pref;
+    return (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches) ? "dark" : "light";
+  }
+  function applyTheme() {
+    var pref = readThemePref();
+    var effective = effectiveTheme(pref);
+    document.documentElement.setAttribute("data-theme", effective);
+    document.documentElement.style.colorScheme = effective;
+    var meta = document.querySelector('meta[name="theme-color"]');
+    if (meta) meta.setAttribute("content", effective === "dark" ? "#2A1E55" : "#7C5CFF");
+    Array.prototype.forEach.call($("themeSeg").querySelectorAll(".seg-btn"), function (btn) {
+      btn.classList.toggle("active", btn.getAttribute("data-theme-choice") === pref);
+    });
+  }
+  if (window.matchMedia) {
+    var mq = window.matchMedia("(prefers-color-scheme: dark)");
+    var mqHandler = function () { if (readThemePref() === "auto") applyTheme(); };
+    if (mq.addEventListener) mq.addEventListener("change", mqHandler);
+    else if (mq.addListener) mq.addListener(mqHandler);
+  }
+
+  // ---------- 画面状態 / タブ ----------
+  var state = {
+    tab: "list",
+    list: { range: RANGES[0], query: "", sheetNo: null },
+    flip: { range: RANGES[0], shuffle: false, unlearnedOnly: false, deck: [], index: 0, flipped: false },
+    test: {
+      phase: "setup",
+      selectedRanges: [RANGES[0]],
+      allRanges: false,
+      unlearnedOnly: true,
+      count: 20,
+      activeCycleKey: null, activeCycleLap: null,
+      inputQuestions: [], inputResults: [], currentInputSession: null
+    },
+    progress: { expandedSessions: {} }
+  };
+  var lastMainTab = "list";
+  var booted = false;
+
+  function switchTab(name) {
+    var opened = booted && state.tab !== name; // 起動時・同じタブの再タップではスタッガーしない
+    if (name !== "settings") lastMainTab = name;
+    state.tab = name;
+    Array.prototype.forEach.call(document.querySelectorAll(".view"), function (v) {
+      v.classList.toggle("active", v.id === "view-" + name);
+    });
+    Array.prototype.forEach.call(document.querySelectorAll(".tab-btn"), function (b) {
+      var t = b.getAttribute("data-tab");
+      b.classList.toggle("active", name === "settings" ? t === lastMainTab : t === name);
+    });
+    $("settingsBtn").setAttribute("aria-pressed", name === "settings" ? "true" : "false");
+    if (name === "list") renderList(opened ? "open" : undefined);
+    if (name === "flip") {
+      var rangeChanged = state.flip.range !== state.list.range;
+      state.flip.range = state.list.range;
+      renderFlipChips(opened);
+      if (rangeChanged || !state.flip.deck.length) flipBuildDeck(); else renderFlipCard();
+    }
+    if (name === "test") {
+      if (state.test.phase === "inputTest") {
+        updateTestPhaseVisibility();
+        renderInputTest(false);
+      } else if (!tryResumeDraft()) {
+        renderTestSetup(opened);
+      }
+    }
+    if (name === "progress") renderProgress();
+    if (name === "settings") refreshOpenaiKeyUI();
     window.scrollTo(0, 0);
   }
 
-  /* ---------- ホーム ---------- */
-  function nextAction() {
-    for (let s = 1; s <= TOTAL_SETS; s++) {
-      if (!hasData(s)) continue;
-      const idx = bySet[s].findIndex(w => !state.learned[wid(w)]);
-      if (idx >= 0) return { kind: 'study', set: s, label: `セット${s}の学習を続ける`, sub: idx === 0 ? '1語目から' : `${idx + 1}語目から` };
+  Array.prototype.forEach.call(document.querySelectorAll(".tab-btn"), function (btn) {
+    btn.addEventListener("click", function () { switchTab(btn.getAttribute("data-tab")); });
+  });
+
+  function openSettings() {
+    if (state.tab === "test" && state.test.phase === "inputTest") {
+      if (!window.confirm("テストの途中です。設定を開くとテストを中断します。中断しますか？")) return;
+      abortInputTest();
     }
-    return { kind: 'test', set: 1, label: 'セット1のテストを受ける', sub: '全語を学習済み' };
+    switchTab("settings");
+  }
+  function closeSettings() { switchTab(lastMainTab || "list"); }
+  $("settingsBtn").addEventListener("click", function () {
+    if (state.tab === "settings") closeSettings(); else openSettings();
+  });
+  $("settingsBackBtn").addEventListener("click", closeSettings);
+
+  // ---------- 一覧 ----------
+  function renderRangeChips(wrapId, current, onPick, animate) {
+    var wrap = $(wrapId);
+    wrap.innerHTML = "";
+    RANGES.forEach(function (r, idx) {
+      var chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "chip" + (current === r ? " active" : "") + (animate ? " stagger-in" : "");
+      if (animate) chip.style.setProperty("--i", idx);
+      chip.innerHTML = rangeChipInner(r, "未チェック" + rangeRemaining(r) + "語");
+      chip.addEventListener("click", function () { onPick(r); });
+      wrap.appendChild(chip);
+    });
+  }
+  function renderListChips(animate) {
+    renderRangeChips("listRangeChips", state.list.range, function (r) { state.list.range = r; renderList("pick"); }, animate);
   }
 
-  function viewHome() {
-    const na = nextAction();
-    const wrongN = wrongWords().length;
-    const totalAvail = TOTAL_SETS * SET_SIZE;
-    const lAll = learnedAll();
-    const sets = [];
-    for (let s = 1; s <= TOTAL_SETS; s++) {
-      if (!hasData(s)) {
-        sets.push(`<li class="set soon"><div class="set-head"><h3>セット${s}</h3><span class="soon-tag">準備中</span></div><p class="set-score">100語・近日公開</p></li>`);
-        continue;
+  // mode: "open"=画面を開いた時（チップも行もスタッガー） / "pick"=セット切替（行だけ） / 未指定=アニメなし
+  function renderList(mode) {
+    var animate = mode === "open" || mode === "pick";
+    renderListChips(mode === "open");
+    var ul = $("listWords");
+    var q = state.list.query.trim().toLowerCase();
+    var words = wordsInRange(state.list.range).filter(function (w) {
+      if (!q) return true;
+      return w.word.toLowerCase().indexOf(q) !== -1 ||
+        (w.meaning || "").toLowerCase().indexOf(q) !== -1 ||
+        String(w.no).indexOf(q) !== -1;
+    });
+    ul.innerHTML = "";
+    if (!words.length) {
+      var empty = document.createElement("li");
+      empty.className = "empty-msg";
+      empty.textContent = "該当する単語がありません";
+      ul.appendChild(empty);
+      return;
+    }
+    words.forEach(function (w, idx) {
+      var learned = isLearned(w.no);
+      var li = document.createElement("li");
+      li.className = "word-row" + (learned ? " is-learned" : "") + (animate ? " stagger-in" : "");
+      if (animate) li.style.setProperty("--i", Math.min(idx, 10));
+      li.setAttribute("data-no", w.no);
+
+      var main = document.createElement("div");
+      main.className = "row-main";
+
+      var chkWrap = document.createElement("label");
+      chkWrap.className = "chk-wrap";
+      var chk = document.createElement("input");
+      chk.type = "checkbox";
+      chk.checked = learned;
+      chk.setAttribute("aria-label", "覚えた: " + w.word);
+      chk.addEventListener("change", function () {
+        setLearned(w.no, chk.checked);
+        li.classList.toggle("is-learned", chk.checked);
+        renderListChips();
+        showToast(chk.checked ? "「" + w.word + "」を覚えた に追加しました" : "「" + w.word + "」のチェックを外しました");
+      });
+      chkWrap.appendChild(chk);
+
+      var textWrap = document.createElement("div");
+      textWrap.className = "row-text";
+      textWrap.innerHTML =
+        '<div class="row-top"><span class="w-no">No.' + w.no + '</span>' +
+        '<span class="w-word">' + escapeHtml(w.word) + '</span>' +
+        '<span class="w-pos">' + escapeHtml(w.pos || "") + '</span></div>' +
+        '<div class="w-meaning-placeholder">タップで意味と詳細を表示</div>' +
+        '<div class="row-hist">' + renderHistoryBlock(w.no) + '</div>';
+      textWrap.setAttribute("role", "button");
+      textWrap.setAttribute("tabindex", "0");
+      textWrap.setAttribute("aria-label", w.word + " の詳細を開く");
+      textWrap.addEventListener("click", function () { openSheet(w.no, textWrap); });
+      textWrap.addEventListener("keydown", function (e) {
+        if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openSheet(w.no, textWrap); }
+      });
+
+      main.appendChild(chkWrap);
+      main.appendChild(textWrap);
+      var sb = buildSpeakBtn(w.word);
+      if (sb) main.appendChild(sb);
+      li.appendChild(main);
+
+      ul.appendChild(li);
+    });
+  }
+
+  $("listSearch").addEventListener("input", function (e) {
+    state.list.query = e.target.value;
+    renderList();
+  });
+
+  // ---------- 単語詳細ボトムシート ----------
+  var sheetTrigger = null, sheetTimer = null;
+  function setBackgroundInert(on) {
+    ["app", "tabbar"].forEach(function (id) {
+      var el = $(id);
+      if (!el) return;
+      if (on) el.setAttribute("inert", ""); else el.removeAttribute("inert");
+    });
+  }
+
+  function renderSheetBody() {
+    var w = wordByNo[state.list.sheetNo];
+    var body = $("sheetBody");
+    body.innerHTML = "";
+    if (!w) return;
+
+    var head = document.createElement("div");
+    head.className = "sheet-head";
+    head.innerHTML = '<span class="w-no">No.' + w.no + '</span><span class="w-pos">' + escapeHtml(w.pos || "") + '</span>';
+    body.appendChild(head);
+
+    var wordRow = document.createElement("div");
+    wordRow.className = "sheet-word-row";
+    wordRow.innerHTML = '<span class="sheet-word">' + escapeHtml(w.word) + '</span>';
+    var sb = buildSpeakBtn(w.word);
+    if (sb) wordRow.appendChild(sb);
+    body.appendChild(wordRow);
+
+    var meaning = document.createElement("div");
+    meaning.className = "sheet-meaning";
+    meaning.textContent = w.meaning || "";
+    body.appendChild(meaning);
+
+    var tipLine = document.createElement("div");
+    tipLine.className = "detail-line";
+    renderTipBlockInto(tipLine, w.no, state.list, renderSheetBody);
+    body.appendChild(tipLine);
+
+    if (w.example) {
+      var ex = document.createElement("div");
+      ex.className = "detail-line";
+      ex.innerHTML = '<span class="detail-label">例文</span><p>' + escapeHtml(w.example) + '</p>' +
+        (w.exampleJa ? '<p class="ja">' + escapeHtml(w.exampleJa) + '</p>' : "");
+      body.appendChild(ex);
+    }
+
+    var hist = document.createElement("div");
+    hist.className = "detail-line";
+    hist.innerHTML = '<span class="detail-label">記録</span>' + renderHistoryBlock(w.no);
+    body.appendChild(hist);
+
+    var label = document.createElement("label");
+    label.className = "check-label";
+    label.innerHTML = '<input type="checkbox"' + (isLearned(w.no) ? " checked" : "") + '>覚えた';
+    label.querySelector("input").addEventListener("change", function (e) {
+      setLearned(w.no, e.target.checked);
+      var row = $("listWords").querySelector('li[data-no="' + w.no + '"]');
+      if (row) {
+        row.classList.toggle("is-learned", e.target.checked);
+        var rc = row.querySelector('.chk-wrap input');
+        if (rc) rc.checked = e.target.checked;
       }
-      const n = bySet[s].length, l = learnedIn(s);
-      const rs = setResults(s);
-      const last = rs[rs.length - 1];
-      const best = rs.reduce((m, r) => Math.max(m, r.score), 0);
-      const score = last
-        ? `前回 ${last.score}/${last.total}（${fmtDate(last.at)}）・最高 ${best}/${last.total}`
-        : 'テスト未受験';
-      sets.push(`<li class="set">
-        <div class="set-head"><h3>セット${s}</h3><span class="num">覚えた ${l} / ${n}語</span></div>
-        ${bar(l, n)}
-        <p class="set-score num">${score}</p>
-        <div class="set-actions">
-          <button class="btn" data-action="study" data-set="${s}">学習</button>
-          <button class="btn" data-action="start-test" data-set="${s}">テスト</button>
-        </div></li>`);
+      renderListChips();
+      showToast(e.target.checked ? "「" + w.word + "」を覚えた に追加しました" : "「" + w.word + "」のチェックを外しました");
+    });
+    body.appendChild(label);
+  }
+
+  function openSheet(no, trigger) {
+    var sheet = $("sheet"), backdrop = $("sheetBackdrop");
+    state.list.sheetNo = no;
+    state.list.tipEdit = null;
+    sheetTrigger = trigger || null;
+    renderSheetBody();
+    $("sheetBody").scrollTop = 0;
+    clearTimeout(sheetTimer);
+    sheet.style.transform = "";
+    sheet.hidden = false;
+    backdrop.hidden = false;
+    void sheet.offsetWidth; // hidden解除直後に reflow してからクラス付与 → スライドアップ
+    sheet.classList.add("open");
+    backdrop.classList.add("open");
+    document.body.classList.add("sheet-open");
+    setBackgroundInert(true);
+    try { $("sheetClose").focus({ preventScroll: true }); } catch (e) {}
+  }
+
+  function closeSheet() {
+    if (state.list.sheetNo == null) return;
+    var sheet = $("sheet"), backdrop = $("sheetBackdrop");
+    state.list.sheetNo = null;
+    state.list.tipEdit = null;
+    sheet.style.transition = "";
+    sheet.style.transform = "";
+    sheet.classList.remove("open");
+    backdrop.classList.remove("open");
+    document.body.classList.remove("sheet-open");
+    setBackgroundInert(false);
+    if (sheetTrigger && document.body.contains(sheetTrigger)) {
+      try { sheetTrigger.focus({ preventScroll: true }); } catch (e) {}
     }
-    return `<div class="screen">
-      <header class="masthead"><h1 tabindex="-1" data-title>英単語帳</h1><p>TOEIC高得点レベルの500語</p></header>
-      <section class="next" aria-label="次にやること">
-        <button class="btn btn-primary" data-action="${na.kind === 'study' ? 'study' : 'start-test'}" data-set="${na.set}"><span>${na.label}</span><small>${na.sub}</small></button>
-      </section>
-      <section class="overall" aria-label="全体の進捗">
-        <p><span>全体の進捗</span><span class="num"><strong>${lAll}</strong> / ${totalAvail}語</span></p>
-        ${bar(lAll, totalAvail)}
-      </section>
-      ${wrongN ? `<button class="queue" data-action="wrong"><span><b class="num">${wrongN}語</b>の間違いを復習する</span>${ICON.next}</button>` : ''}
-      <h2 class="sets-title">セット</h2>
-      <ul class="sets">${sets.join('')}</ul>
-    </div>`;
+    sheetTrigger = null;
+    clearTimeout(sheetTimer);
+    sheetTimer = setTimeout(function () {
+      if (state.list.sheetNo != null) return; // 閉じている間に開き直された
+      sheet.hidden = true;
+      backdrop.hidden = true;
+    }, reduceMotion() ? 0 : 420);
   }
 
-  /* ---------- 学習 ---------- */
-  function startStudy(s, filter = 'all') {
-    const all = bySet[s];
-    let deck = all;
-    if (filter === 'unlearned') deck = all.filter(w => !state.learned[wid(w)]);
-    let i = 0;
-    if (filter === 'all') { const f = all.findIndex(w => !state.learned[wid(w)]); i = f < 0 ? 0 : f; }
-    study = { set: s, deck, i, flipped: false, filter };
-  }
+  $("sheetClose").addEventListener("click", closeSheet);
+  $("sheetBackdrop").addEventListener("click", closeSheet);
+  document.addEventListener("keydown", function (e) {
+    if (e.key === "Escape" && state.list.sheetNo != null) closeSheet();
+  });
 
-  function viewStudy() {
-    const st = study, deck = st.deck;
-    if (!deck.length) {
-      return `<div class="screen study">
-        <div class="topbar"><button class="icon-btn" data-action="home" aria-label="ホームへ戻る">${ICON.back}</button><h1 tabindex="-1" data-title>セット${st.set}</h1><span></span></div>
-        <div class="empty"><h2>未習得の単語はありません</h2><p>セット${st.set}の全${bySet[st.set].length}語を覚えました。テストで定着を確かめましょう。</p></div>
-        <div class="actions">
-          <button class="btn btn-primary" data-action="start-test" data-set="${st.set}">セット${st.set}のテストを受ける</button>
-          <button class="btn" data-action="filter" data-filter="all">すべての単語を見る</button>
-        </div></div>`;
+  // ハンドルを下にドラッグして閉じる（指に追従するのは動きを減らす設定がオフの時だけ）
+  (function sheetDrag() {
+    var grab = $("sheetGrab"), sheet = $("sheet");
+    var sy = 0, dy = 0, dragging = false;
+    grab.addEventListener("touchstart", function (e) {
+      if (!e.touches[0]) return;
+      sy = e.touches[0].clientY; dy = 0; dragging = true;
+    }, { passive: true });
+    grab.addEventListener("touchmove", function (e) {
+      if (!dragging || !e.touches[0]) return;
+      dy = Math.max(0, e.touches[0].clientY - sy);
+      if (!reduceMotion()) {
+        sheet.style.transition = "none";
+        sheet.style.transform = "translateY(" + dy + "px)";
+      }
+    }, { passive: true });
+    function end() {
+      if (!dragging) return;
+      dragging = false;
+      sheet.style.transition = "";
+      if (dy > 90) { closeSheet(); }
+      else { sheet.style.transform = ""; }
+      dy = 0;
     }
-    const w = deck[st.i];
-    const learned = !!state.learned[wid(w)];
-    const last = st.i === deck.length - 1;
-    return `<div class="screen study">
-      <div class="topbar">
-        <button class="icon-btn" data-action="home" aria-label="ホームへ戻る">${ICON.back}</button>
-        <h1 tabindex="-1" data-title>セット${st.set}</h1>
-        <span class="count num" id="count">${st.i + 1} / ${deck.length}</span>
-      </div>
-      <div id="deckbar">${bar(st.i + 1, deck.length)}</div>
-      <div class="seg" role="group" aria-label="表示する単語">
-        <button data-action="filter" data-filter="all" aria-pressed="${st.filter === 'all'}">すべて</button>
-        <button data-action="filter" data-filter="unlearned" aria-pressed="${st.filter === 'unlearned'}">未習得のみ</button>
-      </div>
-      <div class="deck">
-        <button class="card ${st.flipped ? 'is-flipped' : ''} ${learned ? 'is-learned' : ''}" id="card" data-action="flip" aria-label="カード：タップして表と裏を切り替え">
-          <span class="card-inner">
-            <span class="face front" id="front" ${st.flipped ? 'aria-hidden="true"' : ''}>
-              <span class="headword en">${esc(w.word)}</span>
-              <span class="pos">${esc(posLabel(w))}</span>
-              <span class="flip-hint">タップして意味を見る</span>
-            </span>
-            <span class="face back" id="back" ${st.flipped ? '' : 'aria-hidden="true"'}>
-              <span class="back-top"><span class="en">${esc(w.word)}</span><span class="pos">${esc(posLabel(w))}</span></span>
-              <span class="meaning">${esc(w.meaning)}</span>
-              <span class="field"><span class="field-label">例文</span><span class="example en">${esc(w.example)}</span><span class="example-ja">${esc(w.exampleJa)}</span></span>
-              <span class="field"><span class="field-label">覚え方</span><span class="hint">${esc(w.hint)}</span></span>
-            </span>
-          </span>
-        </button>
-      </div>
-      <div class="dock">
-        <button class="btn btn-block learn-btn" id="learn" data-action="learned" aria-pressed="${learned}"><span class="box">${ICON.check}</span><span id="learn-label">${learned ? '覚えた' : '覚えたらチェック'}</span></button>
-        <div class="dock-nav">
-          <button class="btn" data-action="prev" ${st.i === 0 ? 'disabled' : ''}>${ICON.back}前へ</button>
-          ${last
-            ? `<button class="btn btn-primary" data-action="start-test" data-set="${st.set}">テストへ${ICON.next}</button>`
-            : `<button class="btn btn-primary" data-action="next">次へ${ICON.next}</button>`}
-        </div>
-      </div>
-    </div>`;
+    grab.addEventListener("touchend", end, { passive: true });
+    grab.addEventListener("touchcancel", end, { passive: true });
+  })();
+
+  // ---------- めくる ----------
+  function renderFlipChips(animate) {
+    renderRangeChips("flipRangeChips", state.flip.range, function (r) {
+      state.flip.range = r;
+      state.list.range = r;
+      renderFlipChips();
+      flipBuildDeck();
+    }, animate);
   }
 
-  function flipCard() {
-    if (!study) return;
-    study.flipped = !study.flipped;
-    const card = document.getElementById('card');
-    card.classList.toggle('is-flipped', study.flipped);
-    document.getElementById('front').setAttribute('aria-hidden', String(study.flipped));
-    document.getElementById('back').setAttribute('aria-hidden', String(!study.flipped));
+  // カードのスプリング遷移: "next" / "prev"（スワイプ・ボタン）、"pop"（めくり）
+  function animateFlipCard(kind) {
+    var card = $("flipCard");
+    if (reduceMotion()) return;
+    card.classList.remove("card-in-next", "card-in-prev", "card-pop");
+    card.style.transition = "";
+    card.style.transform = "";
+    void card.offsetWidth;
+    var cls = kind === "next" ? "card-in-next" : (kind === "prev" ? "card-in-prev" : "card-pop");
+    card.classList.add(cls);
+    card.addEventListener("animationend", function () { card.classList.remove(cls); }, { once: true });
   }
-
-  function toggleLearned() {
-    const w = study.deck[study.i], id = wid(w);
-    if (state.learned[id]) delete state.learned[id]; else state.learned[id] = new Date().toISOString();
-    save();
-    const on = !!state.learned[id];
-    const btn = document.getElementById('learn');
-    btn.setAttribute('aria-pressed', String(on));
-    document.getElementById('learn-label').textContent = on ? '覚えた' : '覚えたらチェック';
-    document.getElementById('card').classList.toggle('is-learned', on);
+  function flipBuildDeck() {
+    var words = wordsInRange(state.flip.range);
+    if (state.flip.unlearnedOnly) words = words.filter(function (w) { return !isLearned(w.no); });
+    if (state.flip.shuffle) words = shuffle(words);
+    state.flip.deck = words;
+    state.flip.index = 0;
+    state.flip.flipped = false;
+    state.flip.tipEdit = null;
+    renderFlipCard();
   }
+  function currentFlipWord() { return state.flip.deck[state.flip.index] || null; }
 
-  function moveStudy(d) {
-    const n = study.i + d;
-    if (n < 0 || n >= study.deck.length) return;
-    study.i = n; study.flipped = false;
-    const keep = d > 0 ? '[data-action="next"],[data-action="start-test"]' : '[data-action="prev"]';
-    app.innerHTML = viewStudy();
-    const f = app.querySelector(keep) || app.querySelector('[data-title]');
-    if (f && !f.disabled) f.focus({ preventScroll: true });
-  }
+  function renderFlipCard() {
+    var w = currentFlipWord();
+    var front = $("flipFront"), back = $("flipBack"), chk = $("flipLearnedChk");
+    $("flipProgress").textContent = state.flip.deck.length ? (state.flip.index + 1) + " / " + state.flip.deck.length : "0 / 0";
 
-  /* ---------- テスト ---------- */
-  const tokens = m => m.split(/[、／]/).map(t => t.trim()).filter(Boolean);
-  function buildChoices(w, taken) {
-    // 似た意味（語句が重なるもの）を誤答から除外し、品詞が同じものを優先
-    const good = tokens(w.meaning);
-    const chosen = [w.meaning];
-    let used = new Set(good);
-    const pool = shuffle(WORDS.filter(x => x !== w && x.meaning !== w.meaning));
-    const samePos = pool.filter(x => x.pos.split('・')[0] === w.pos.split('・')[0]);
-    for (const x of samePos.concat(pool)) {
-      if (chosen.length === 4) break;
-      if (chosen.includes(x.meaning)) continue;
-      const t = tokens(x.meaning);
-      if (t.some(k => used.has(k))) continue;
-      chosen.push(x.meaning); t.forEach(k => used.add(k));
+    if (!w) {
+      state.flip.tipEdit = null;
+      $("flipFrontNo").textContent = "";
+      $("flipFrontWord").textContent = "カードがありません";
+      $("flipFrontSpeakWrap").innerHTML = "";
+      $("flipBackSpeakWrap").innerHTML = "";
+      front.hidden = false;
+      back.hidden = true;
+      chk.checked = false;
+      chk.disabled = true;
+      $("flipBackTipWrap").innerHTML = "";
+      $("flipBackHistory").innerHTML = "";
+      return;
     }
-    return shuffle(chosen);
+    if (state.flip.tipEdit && state.flip.tipEdit.no !== w.no) state.flip.tipEdit = null;
+    chk.disabled = false;
+    $("flipFrontNo").textContent = "No." + w.no + " ・ " + (w.pos || "");
+    $("flipFrontWord").textContent = w.word;
+    var fs = $("flipFrontSpeakWrap"); fs.innerHTML = "";
+    var fb = buildSpeakBtn(w.word); if (fb) fs.appendChild(fb);
+    var bs = $("flipBackSpeakWrap"); bs.innerHTML = "";
+    var bb = buildSpeakBtn(w.word); if (bb) bs.appendChild(bb);
+    $("flipBackPos").textContent = "品詞: " + (w.pos || "");
+    $("flipBackMeaning").textContent = w.meaning || "";
+    renderTipBlockInto($("flipBackTipWrap"), w.no, state.flip, renderFlipCard);
+    $("flipBackExample").textContent = w.example || "";
+    $("flipBackExampleJa").textContent = w.exampleJa || "";
+    $("flipBackExampleWrap").style.display = w.example ? "" : "none";
+    $("flipBackHistory").innerHTML = renderHistoryBlock(w.no);
+    front.hidden = state.flip.flipped;
+    back.hidden = !state.flip.flipped;
+    chk.checked = isLearned(w.no);
   }
 
-  function startTest(kind, s) {
-    let words;
-    if (kind === 'retest') words = shuffle(wrongWords()).slice(0, TEST_LEN);
-    else words = shuffle(bySet[s]).slice(0, TEST_LEN);
-    if (!words.length) { go('#/'); return; }
-    session = {
-      kind, set: s || 0, i: 0, done: false,
-      qs: words.map(w => ({ w, choices: buildChoices(w), picked: null })),
+  $("flipCard").addEventListener("click", function (e) {
+    if (!currentFlipWord()) return;
+    // 裏面のボタン・入力欄・覚え方ブロックの操作ではめくり直さない
+    if (e.target.closest && e.target.closest("button, textarea, input, #flipBackTipWrap")) return;
+    state.flip.flipped = !state.flip.flipped;
+    renderFlipCard();
+    animateFlipCard("pop");
+  });
+
+  function flipGoto(delta) {
+    if (!state.flip.deck.length) return;
+    var next = Math.max(0, Math.min(state.flip.deck.length - 1, state.flip.index + delta));
+    var moved = next !== state.flip.index;
+    if (moved) state.flip.tipEdit = null;
+    state.flip.index = next;
+    state.flip.flipped = false;
+    renderFlipCard();
+    if (moved) animateFlipCard(delta > 0 ? "next" : "prev");
+  }
+  $("flipPrevBtn").addEventListener("click", function () { flipGoto(-1); });
+  $("flipNextBtn").addEventListener("click", function () { flipGoto(1); });
+
+  (function flipSwipe() {
+    var outer = document.querySelector(".flip-card-outer");
+    var card = $("flipCard");
+    var sx = 0, sy = 0, tracking = false, dragged = false;
+    function springBack() {
+      if (!dragged) return;
+      dragged = false;
+      card.style.transition = "transform .5s var(--ease-spring)";
+      card.style.transform = "";
+      setTimeout(function () { card.style.transition = ""; }, 520);
+    }
+    outer.addEventListener("touchstart", function (e) {
+      if (!e.touches[0]) return;
+      var el = e.target;
+      if (el && el.closest && el.closest("textarea, input, button, #flipBackTipWrap")) { tracking = false; return; }
+      sx = e.touches[0].clientX; sy = e.touches[0].clientY; tracking = true; dragged = false;
+    }, { passive: true });
+    // 指に追従してカードが傾きながら動く（動きを減らす設定の時は追従しない）
+    outer.addEventListener("touchmove", function (e) {
+      if (!tracking || reduceMotion() || !e.touches[0]) return;
+      var dx = e.touches[0].clientX - sx, dy = e.touches[0].clientY - sy;
+      if (Math.abs(dx) < 10 || Math.abs(dx) < Math.abs(dy)) return;
+      dragged = true;
+      card.style.transition = "none";
+      card.style.transform = "translateX(" + (dx * 0.5).toFixed(1) + "px) rotate(" + (dx * 0.02).toFixed(2) + "deg)";
+    }, { passive: true });
+    outer.addEventListener("touchend", function (e) {
+      if (!tracking) return;
+      tracking = false;
+      var t = e.changedTouches[0];
+      if (!t) { springBack(); return; }
+      var dx = t.clientX - sx, dy = t.clientY - sy;
+      var swiped = Math.abs(dx) > 45 && Math.abs(dx) > Math.abs(dy);
+      var atEdge = swiped && (dx < 0
+        ? state.flip.index >= state.flip.deck.length - 1
+        : state.flip.index <= 0);
+      if (swiped && !atEdge) {
+        dragged = false;
+        card.style.transition = ""; card.style.transform = "";
+        flipGoto(dx < 0 ? 1 : -1);
+      } else {
+        springBack(); // 端やしきい値未満ではバネで元の位置に戻る
+      }
+    }, { passive: true });
+    outer.addEventListener("touchcancel", function () { tracking = false; springBack(); }, { passive: true });
+  })();
+
+  $("flipLearnedChk").addEventListener("change", function (e) {
+    var w = currentFlipWord();
+    if (!w) return;
+    setLearned(w.no, e.target.checked);
+    showToast(e.target.checked ? "「" + w.word + "」を覚えた に追加しました" : "「" + w.word + "」のチェックを外しました");
+  });
+  $("flipShuffleBtn").addEventListener("click", function (e) {
+    state.flip.shuffle = !state.flip.shuffle;
+    e.currentTarget.textContent = "シャッフル: " + (state.flip.shuffle ? "オン" : "オフ");
+    e.currentTarget.setAttribute("aria-pressed", String(state.flip.shuffle));
+    flipBuildDeck();
+  });
+  $("flipUnlearnedBtn").addEventListener("click", function (e) {
+    state.flip.unlearnedOnly = !state.flip.unlearnedOnly;
+    e.currentTarget.textContent = "未習得だけ: " + (state.flip.unlearnedOnly ? "オン" : "オフ");
+    e.currentTarget.setAttribute("aria-pressed", String(state.flip.unlearnedOnly));
+    flipBuildDeck();
+  });
+  $("flipStartBtn").addEventListener("click", flipBuildDeck);
+
+  // ---------- テスト ----------
+  function updateTestPhaseVisibility() {
+    var phase = state.test.phase;
+    $("testSetup").style.display = phase === "setup" ? "" : "none";
+    $("inputTest").style.display = phase === "inputTest" ? "" : "none";
+    $("inputResult").style.display = phase === "inputResult" ? "" : "none";
+  }
+  function showSetupMessage(msg) {
+    var el = $("testSetupMsg");
+    el.style.display = "";
+    el.textContent = msg;
+  }
+  function toggleTestRange(r) {
+    if (r === "ALL") { state.test.allRanges = true; state.test.selectedRanges = []; }
+    else { state.test.allRanges = false; state.test.selectedRanges = [r]; }
+    renderTestSetup();
+  }
+
+  function renderCycleStatus() {
+    var key = currentCycleKey();
+    var rangeKey = key.slice(0, key.lastIndexOf("|"));
+    var c = getCycle(key);
+    advanceLapIfPossible(c, cycleModeFromKey(key), poolNosForKey(key));
+    saveProgress();
+    var unchecked = wordsForRangeKey(rangeKey).filter(function (w) { return !isLearned(w.no); }).length;
+    var info = cycleStatusInfo(key);
+    var rows = ['<div class="cycle-row">未チェック: <span class="cv">' + unchecked + '語</span>（範囲内の未習得）</div>'];
+    if (info.poolSize === 0) {
+      rows.push('<div class="cycle-row">対象の単語がありません。</div>');
+    } else if (!info.everStarted) {
+      rows.push('<div class="cycle-row">今の周回: <span class="cv">0周目</span>（開始すると1周目、' + info.poolSize + '語が対象）</div>');
+    } else {
+      rows.push('<div class="cycle-row">今の周回: <span class="cv">' + info.lap + '周目</span></div>');
+      rows.push('<div class="cycle-row">この周のテスト済み: <span class="cv">' + info.tested + (info.lapTotalReliable ? ' / ' + info.lapTotal : '') + '語</span>（残り' + info.z + '語）</div>');
+      rows.push('<div class="cycle-row">この周の×: <span class="cv">' + info.wrong + '語</span></div>');
+    }
+    $("testCycleStatus").innerHTML = rows.join("");
+  }
+
+  function renderTestSetup(animate) {
+    updateTestPhaseVisibility();
+    $("testSetupMsg").style.display = "none";
+
+    var rwrap = $("testRangeChips");
+    rwrap.innerHTML = "";
+    RANGES.concat(["ALL"]).forEach(function (r, idx) {
+      var selected = r === "ALL" ? state.test.allRanges : (!state.test.allRanges && state.test.selectedRanges.indexOf(r) !== -1);
+      var chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "chip" + (selected ? " active" : "") + (animate ? " stagger-in" : "");
+      if (animate) chip.style.setProperty("--i", idx);
+      chip.innerHTML = r === "ALL"
+        ? '<b>全範囲</b><span class="rest">' + ALL_WORDS.length + '語</span>'
+        : rangeChipInner(r, "未チェック" + rangeRemaining(r) + "語");
+      chip.addEventListener("click", function () { toggleTestRange(r); });
+      rwrap.appendChild(chip);
+    });
+
+    Array.prototype.forEach.call($("testTargetSeg").querySelectorAll(".seg-btn"), function (btn) {
+      btn.classList.toggle("active", (btn.getAttribute("data-target") === "unchecked") === state.test.unlearnedOnly);
+    });
+
+    var cwrap = $("testCountChips");
+    cwrap.innerHTML = "";
+    TEST_COUNT_OPTIONS.forEach(function (c, idx) {
+      var chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "chip" + (state.test.count === c ? " active" : "") + (animate ? " stagger-in" : "");
+      if (animate) chip.style.setProperty("--i", idx + 2);
+      chip.innerHTML = "<b>" + c + "問</b>";
+      chip.addEventListener("click", function () { state.test.count = c; renderTestSetup(); });
+      cwrap.appendChild(chip);
+    });
+    renderCycleStatus();
+  }
+
+  $("testTargetSeg").addEventListener("click", function (e) {
+    var btn = e.target.closest(".seg-btn");
+    if (!btn) return;
+    state.test.unlearnedOnly = btn.getAttribute("data-target") === "unchecked";
+    renderTestSetup();
+  });
+  $("cycleResetBtn").addEventListener("click", function () {
+    if (!window.confirm("この範囲×対象の周回をリセットします。よろしいですか？")) return;
+    delete progress.cycles[currentCycleKey()];
+    saveProgress();
+    renderTestSetup();
+  });
+
+  function handleStartClick() {
+    var key = currentCycleKey();
+    var mode = cycleModeFromKey(key);
+    var freshPool = poolNosForKey(key);
+    if (!freshPool.length) {
+      state.test.phase = "setup";
+      renderTestSetup();
+      showSetupMessage("出題できる単語がありません");
+      return;
+    }
+    var c = getCycle(key);
+    startNewLapIfEmpty(c, mode, freshPool);
+    var n = Math.min(state.test.count, c.remaining.length);
+    if (n <= 0) {
+      state.test.phase = "setup";
+      renderTestSetup();
+      showSetupMessage("この組み合わせは周回完了です。対象の単語が増えると次の周を始められます。");
+      return;
+    }
+    var take = cycleTake(c.remaining, n);
+    c.remaining = take.leftover;
+    c.reserved = take.taken.slice();
+    saveProgress();
+    state.test.activeCycleKey = key;
+    state.test.activeCycleLap = c.lap;
+    startInputTest(take.taken.map(function (no) { return wordByNo[no]; }).filter(Boolean));
+  }
+  // 出題の準備（抽選・描画）の間、ボタンにスピナーを出す。待っている間に画面を離れたら開始しない。
+  function startWithLoading(e) {
+    runWithLoading(e.currentTarget, function () { if (state.tab === "test") handleStartClick(); });
+  }
+  $("testStartBtn").addEventListener("click", startWithLoading);
+
+  // ---------- 入力テスト（英→日・記述式） ----------
+  var VERDICT_LABELS = { correct: "正解", close: "近い（正解扱い）", wrong: "不正解" };
+  var VERDICT_CLASSES = { correct: "v-correct", close: "v-close", wrong: "v-wrong" };
+
+  function startInputTest(chosen) {
+    state.test.inputQuestions = chosen.map(function (w) {
+      return { no: w.no, word: w.word, pos: w.pos, meaning: w.meaning, answer: "" };
+    });
+    state.test.currentInputSession = null;
+    state.test.phase = "inputTest";
+    updateTestPhaseVisibility();
+    renderInputTest(false, true);
+    saveInputDraft();
+    window.scrollTo(0, 0);
+  }
+
+  // 回答済みの問題数に合わせて進捗バーを伸ばす（幅は CSS の transition でなめらかに動く）
+  function updateTestProgress() {
+    var qs = state.test.inputQuestions, total = qs.length;
+    var done = qs.filter(function (q) { return (q.answer || "").trim() !== ""; }).length;
+    var pct = total ? Math.round(done / total * 100) : 0;
+    $("testProgText").textContent = done + " / " + total;
+    $("testProgBar").style.width = pct + "%";
+    $("testProgTrack").setAttribute("aria-valuenow", String(pct));
+  }
+
+  function renderInputTest(resumed, autoFocus) {
+    $("inputResumeNote").style.display = resumed ? "" : "none";
+    var wrap = $("inputTestList");
+    wrap.innerHTML = "";
+    var inputEls = [];
+    var qs = state.test.inputQuestions;
+    updateTestProgress();
+    qs.forEach(function (q, idx) {
+      var div = document.createElement("div");
+      div.className = "input-q card";
+      div.setAttribute("data-no", q.no);
+
+      var head = document.createElement("div");
+      head.className = "input-q-head";
+      head.innerHTML = '<span class="input-q-no">' + (idx + 1) + '. No.' + q.no + '</span><span class="w-pos">' + escapeHtml(q.pos || "") + '</span>';
+      div.appendChild(head);
+
+      var wordRow = document.createElement("div");
+      wordRow.className = "input-q-word-row";
+      var wordSpan = document.createElement("span");
+      wordSpan.className = "input-q-word";
+      wordSpan.textContent = q.word;
+      wordRow.appendChild(wordSpan);
+      var sb = buildSpeakBtn(q.word);
+      if (sb) wordRow.appendChild(sb);
+      div.appendChild(wordRow);
+
+      var input = document.createElement("input");
+      input.type = "text";
+      input.className = "input-answer";
+      input.setAttribute("aria-label", "回答: " + q.word);
+      input.setAttribute("enterkeyhint", idx === qs.length - 1 ? "done" : "next");
+      input.autocomplete = "off";
+      input.lang = "ja";
+      input.value = q.answer || "";
+      input.addEventListener("input", function (e) { q.answer = e.target.value; saveInputDraft(); updateTestProgress(); });
+      input.addEventListener("keydown", function (e) {
+        if (e.key !== "Enter" && e.keyCode !== 13) return;
+        if (e.isComposing || e.keyCode === 229) return;
+        e.preventDefault();
+        var nextInput = inputEls[idx + 1];
+        if (nextInput) nextInput.focus(); else $("inputGradeBtn").click();
+      });
+      input.addEventListener("focus", function () {
+        setTimeout(function () { if (input.scrollIntoView) input.scrollIntoView({ block: "center", inline: "nearest" }); }, 50);
+      });
+      inputEls.push(input);
+      div.appendChild(input);
+      wrap.appendChild(div);
+    });
+
+    if (autoFocus && inputEls.length) {
+      var target = inputEls[0];
+      for (var i = 0; i < inputEls.length; i++) {
+        if (!(qs[i].answer || "").trim()) { target = inputEls[i]; break; }
+      }
+      setTimeout(function () { target.focus(); }, 0);
+    }
+  }
+
+  function saveInputDraft() {
+    if (state.test.phase !== "inputTest") return;
+    var payload = {
+      settings: {
+        format: "input",
+        ranges: state.test.allRanges ? ["ALL"] : state.test.selectedRanges.slice(),
+        unlearnedOnly: state.test.unlearnedOnly,
+        count: state.test.count
+      },
+      activeCycleKey: state.test.activeCycleKey,
+      activeCycleLap: state.test.activeCycleLap,
+      questions: state.test.inputQuestions.map(function (q) {
+        return { no: q.no, word: q.word, pos: q.pos, meaning: q.meaning, answer: q.answer };
+      })
     };
-    go(kind === 'retest' ? '#/retest' : '#/test/' + s);
+    try { localStorage.setItem(DRAFT_KEY, JSON.stringify(payload)); } catch (e) {}
+  }
+  function clearInputDraft() { try { localStorage.removeItem(DRAFT_KEY); } catch (e) {} }
+  function loadInputDraft() {
+    var raw;
+    try { raw = localStorage.getItem(DRAFT_KEY); } catch (e) { return null; }
+    if (!raw) return null;
+    try {
+      var parsed = JSON.parse(raw);
+      if (!parsed || !Array.isArray(parsed.questions) || !parsed.questions.length) return null;
+      // 単語データと一致しない問題が混ざる下書きは破棄する
+      var ok = parsed.questions.every(function (q) { return q && wordByNo[q.no] && wordByNo[q.no].word === q.word; });
+      return ok ? parsed : null;
+    } catch (e) { return null; }
   }
 
-  const title = () => session.kind === 'retest' ? '再テスト' : `セット${session.set} テスト`;
+  function tryResumeDraft() {
+    var draft = loadInputDraft();
+    if (!draft) return false;
+    if (draft.settings) {
+      var rs = draft.settings.ranges;
+      if (rs && rs.indexOf("ALL") !== -1) { state.test.allRanges = true; state.test.selectedRanges = []; }
+      else if (rs && rs.length) { state.test.allRanges = false; state.test.selectedRanges = rs.slice(); }
+      if (typeof draft.settings.unlearnedOnly === "boolean") state.test.unlearnedOnly = draft.settings.unlearnedOnly;
+      if (draft.settings.count) state.test.count = draft.settings.count;
+    }
+    state.test.activeCycleKey = draft.activeCycleKey || null;
+    state.test.activeCycleLap = draft.activeCycleLap || null;
+    state.test.inputQuestions = draft.questions.map(function (q) {
+      return { no: q.no, word: q.word, pos: q.pos, meaning: q.meaning, answer: q.answer || "" };
+    });
+    state.test.phase = "inputTest";
+    updateTestPhaseVisibility();
+    renderInputTest(true, true);
+    return true;
+  }
 
-  function viewTest() {
-    const ss = session;
-    if (ss.done) return { html: viewResult(), focusSel: '[data-title]' };
-    const q = ss.qs[ss.i], w = q.w, answered = q.picked !== null;
-    const correct = answered && q.picked === w.meaning;
-    const choices = q.choices.map((c, idx) => {
-      let cls = '', icon = '';
-      if (answered) {
-        if (c === w.meaning) { cls = 'is-right'; icon = ICON.check; }
-        else if (c === q.picked) { cls = 'is-wrong'; icon = ICON.cross; }
-        else cls = 'is-dim';
+  function computeInputStats(results) {
+    var total = results.length;
+    var good = results.filter(function (r) { return r.verdict === "correct" || r.verdict === "close"; }).length;
+    return { total: total, good: good, acc: total ? Math.round((good / total) * 100) : 0 };
+  }
+  function showAiNote(show, message, busy) {
+    var el = $("inputAiNote");
+    el.style.display = show ? "" : "none";
+    el.classList.toggle("busy", !!(show && busy));
+    if (show) el.textContent = message || "AI判定は使えませんでした";
+  }
+
+  function sessionItemFrom(r) {
+    var w = wordByNo[r.no];
+    return {
+      no: r.no, word: r.word, meaning: r.meaning, pos: r.pos || (w ? w.pos : ""),
+      mark: r.verdict === "wrong" ? "×" : "○", answer: r.answer || "", verdict: r.verdict
+    };
+  }
+
+  function abortInputTest() {
+    var qs = state.test.inputQuestions;
+    var answered = qs.filter(function (q) { return (q.answer || "").trim() !== ""; });
+    var unanswered = qs.filter(function (q) { return (q.answer || "").trim() === ""; });
+    var wrongNos = [];
+    if (answered.length) {
+      var correctCount = 0;
+      var items = answered.map(function (q) {
+        var g = gradeAnswer(q.answer, q.meaning);
+        var wrong = g.verdict === "wrong";
+        appendHistory(q.no, wrong ? "×" : "○");
+        setLearned(q.no, !wrong);
+        if (wrong) wrongNos.push(q.no); else correctCount++;
+        return sessionItemFrom({ no: q.no, word: q.word, meaning: q.meaning, pos: q.pos, answer: q.answer, verdict: g.verdict });
+      });
+      addSession({
+        id: makeSessionId(), source: "app", type: "input", at: new Date().toISOString(),
+        ranges: sessionRangesFromNos(answered.map(function (q) { return q.no; })),
+        total: answered.length, correct: correctCount,
+        cycleKey: state.test.activeCycleKey || null, lap: state.test.activeCycleLap || null,
+        items: items
+      });
+    }
+    reconcileCycleAfterTest(
+      state.test.activeCycleKey,
+      answered.map(function (q) { return q.no; }),
+      wrongNos,
+      unanswered.map(function (q) { return q.no; })
+    );
+    state.test.activeCycleKey = null;
+    clearInputDraft();
+    state.test.phase = "setup";
+    renderTestSetup();
+    showToast(answered.length ? "テストを中断しました（回答した分は記録しました）" : "テストを中断しました");
+  }
+
+  function refreshResultCards() {
+    if (state.test.phase === "inputResult") renderInputResult();
+  }
+
+  function buildResultItemCard(item) {
+    var div = document.createElement("div");
+    div.className = "input-result-item card";
+    div.setAttribute("data-no", item.no);
+    var answerText = (item.answer && String(item.answer).trim() !== "") ? item.answer : "（未回答）";
+
+    var head = document.createElement("div");
+    head.className = "ir-head";
+    head.innerHTML = '<span class="ir-no">No.' + item.no + '</span><span class="ir-word">' + escapeHtml(item.word) + '</span>';
+    var sb = buildSpeakBtn(item.word);
+    if (sb) head.appendChild(sb);
+    div.appendChild(head);
+
+    var rest = document.createElement("div");
+    rest.innerHTML =
+      '<div class="ir-line"><span class="ir-lbl">回答</span><span class="ir-val">' + escapeHtml(answerText) + '</span></div>' +
+      '<div class="ir-line"><span class="ir-lbl">正しい意味</span><span class="ir-val">' + escapeHtml(item.meaning) + '</span></div>' +
+      '<div class="verdict ' + (VERDICT_CLASSES[item.verdict] || "v-wrong") + '">' + (VERDICT_LABELS[item.verdict] || "不正解") + '</div>' +
+      '<div class="btn-row" style="margin-top:0;">' +
+      '<button type="button" class="btn btn-mark-correct">正解にする</button>' +
+      '<button type="button" class="btn btn-mark-wrong">不正解にする</button></div>';
+    while (rest.firstChild) div.appendChild(rest.firstChild);
+    div.querySelector(".btn-mark-correct").addEventListener("click", function () { manualSetVerdict(item.no, "correct"); });
+    div.querySelector(".btn-mark-wrong").addEventListener("click", function () { manualSetVerdict(item.no, "wrong"); });
+
+    var w = wordByNo[item.no];
+    if (w && w.example) {
+      var ex = document.createElement("div");
+      ex.className = "detail-line";
+      ex.innerHTML = '<span class="detail-label">例文</span><p>' + escapeHtml(w.example) + '</p>' +
+        (w.exampleJa ? '<p class="ja">' + escapeHtml(w.exampleJa) + '</p>' : "");
+      div.appendChild(ex);
+    }
+    var tipLine = document.createElement("div");
+    tipLine.className = "detail-line";
+    renderTipBlockInto(tipLine, item.no, state.test, refreshResultCards);
+    div.appendChild(tipLine);
+
+    var learnedLabel = document.createElement("label");
+    learnedLabel.className = "check-label";
+    learnedLabel.style.marginTop = "10px";
+    learnedLabel.innerHTML = '<input type="checkbox"' + (isLearned(item.no) ? " checked" : "") + '>覚えた';
+    learnedLabel.querySelector("input").addEventListener("change", function (e) {
+      setLearned(item.no, e.target.checked);
+      showToast(e.target.checked ? "「" + item.word + "」を覚えた に追加しました" : "「" + item.word + "」のチェックを外しました");
+    });
+    div.appendChild(learnedLabel);
+    return div;
+  }
+
+  var CONFETTI_THRESHOLD = 80; // 正答率(%)がこの値以上なら紙吹雪
+
+  // opts.graded: 採点直後（不正解カードをシェイク、高得点ならスプリング+紙吹雪） / opts.shakeNo: 手動で不正解にした1件だけシェイク
+  function renderInputResult(opts) {
+    opts = opts || {};
+    var results = state.test.inputResults;
+    var stats = computeInputStats(results);
+    $("inputResultAccuracy").textContent = stats.acc + "%";
+    $("inputResultCorrect").textContent = stats.good + " / " + stats.total;
+    var listWrap = $("inputResultList");
+    listWrap.innerHTML = "";
+    var shakeIdx = 0, canMove = !reduceMotion();
+    results.forEach(function (r) {
+      var card = buildResultItemCard(r);
+      if (canMove && r.verdict === "wrong" && (opts.graded || opts.shakeNo === r.no)) {
+        card.style.setProperty("--i", Math.min(shakeIdx++, 5));
+        card.classList.add("shake");
+        card.addEventListener("animationend", function () { card.classList.remove("shake"); }, { once: true });
       }
-      return `<li><button class="choice ${cls}" data-action="answer" data-idx="${idx}" ${answered ? 'disabled' : ''}><span>${esc(c)}</span>${icon}</button></li>`;
-    }).join('');
-    const verdict = answered ? `<div class="verdict" role="status">
-        <strong class="${correct ? 'right' : 'wrong'}">${correct ? '正解' : '不正解'}</strong>
-        ${correct ? '' : `<p class="hint">${esc(w.hint)}</p>`}
-      </div>` : '<div class="verdict"></div>';
-    const lastQ = ss.i === ss.qs.length - 1;
-    const html = `<div class="screen test">
-      <div class="topbar">
-        <button class="icon-btn" data-action="quit-test" aria-label="テストをやめてホームへ戻る">${ICON.back}</button>
-        <h1 data-title tabindex="-1">${title()}</h1>
-        <span class="count num">${ss.i + 1} / ${ss.qs.length}</span>
-      </div>
-      ${bar(ss.i + (answered ? 1 : 0), ss.qs.length)}
-      <div class="q"><div class="headword en">${esc(w.word)}</div><div class="pos">${esc(posLabel(w))}</div></div>
-      <ul class="choices">${choices}</ul>
-      ${verdict}
-      <div class="actions" style="margin-top:auto">
-        ${answered ? `<button class="btn btn-primary btn-block" data-action="next-q" data-autofocus>${lastQ ? '結果を見る' : '次の問題'}${ICON.next}</button>` : ''}
-      </div>
-    </div>`;
-    return { html, focusSel: answered ? '[data-autofocus]' : '[data-title]' };
-  }
+      listWrap.appendChild(card);
+    });
 
-  function answer(idx) {
-    const q = session.qs[session.i];
-    if (q.picked !== null) return;
-    q.picked = q.choices[idx];
-    const id = wid(q.w);
-    if (q.picked === q.w.meaning) { delete state.wrong[id]; }
-    else { state.wrong[id] = new Date().toISOString(); }
-    save();
-    const r = viewTest();
-    app.innerHTML = r.html;
-    const f = app.querySelector(r.focusSel);
-    if (f) f.focus({ preventScroll: true });
-  }
-
-  function nextQ() {
-    const q = session.qs[session.i];
-    if (q.picked === null) return;
-    if (session.i < session.qs.length - 1) session.i++;
-    else {
-      session.done = true;
-      if (session.kind === 'set') {
-        const score = session.qs.filter(x => x.picked === x.w.meaning).length;
-        state.results.push({ set: session.set, score, total: session.qs.length, at: new Date().toISOString() });
-        if (state.results.length > 200) state.results = state.results.slice(-200);
-        save();
+    var celebrate = !!opts.graded && stats.total > 0 && stats.acc >= CONFETTI_THRESHOLD;
+    Array.prototype.forEach.call(document.querySelectorAll("#inputResult .result-stat"), function (el) {
+      el.classList.remove("spring");
+      if (celebrate && canMove) {
+        void el.offsetWidth;
+        el.classList.add("spring");
+        el.addEventListener("animationend", function () { el.classList.remove("spring"); }, { once: true });
       }
-    }
-    render();
+    });
+    if (celebrate) launchConfetti();
   }
 
-  function viewResult() {
-    const ss = session;
-    const total = ss.qs.length;
-    const missed = ss.qs.filter(q => q.picked !== q.w.meaning);
-    const score = total - missed.length;
-    const remaining = wrongWords().length;
-    const msg = missed.length === 0
-      ? '全問正解です。'
-      : `${missed.length}語を間違えました。下の単語は復習リストに入っています。`;
-    const retake = ss.kind === 'retest'
-      ? (remaining ? `<button class="btn btn-primary" data-action="restart">残り${remaining}語を再テスト</button>` : '')
-      : `<button class="btn" data-action="restart">もう一度テスト</button>`;
-    return `<div class="screen result">
-      <div class="topbar"><button class="icon-btn" data-action="quit-test" aria-label="ホームへ戻る">${ICON.back}</button><h1 data-title tabindex="-1">${title()}の結果</h1><span></span></div>
-      <section class="score">
-        <p class="big num">${score} / ${total}</p>
-        <p>${msg}</p>
-      </section>
-      ${missed.length ? `<section><h2 class="section-title">間違えた単語</h2><ul class="list">${missed.map(q => `<li>
-          <div class="row"><span class="en">${esc(q.w.word)}</span><span class="meta">${esc(posLabel(q.w))}</span></div>
-          <span class="m">${esc(q.w.meaning)}</span><span class="h">${esc(q.w.hint)}</span></li>`).join('')}</ul></section>` : ''}
-      <div class="actions">
-        ${missed.length && ss.kind === 'set' ? `<button class="btn btn-primary" data-action="wrong">間違えた単語を復習する</button>` : ''}
-        ${retake}
-        <button class="btn" data-action="home">ホームへ</button>
-      </div>
-    </div>`;
+  function syncCurrentInputSessionScore() {
+    var session = state.test.currentInputSession;
+    if (!session) return;
+    session.correct = computeInputStats(state.test.inputResults).good;
+    saveProgress();
   }
 
-  /* ---------- 間違えた単語 ---------- */
-  function viewWrong() {
-    const list = wrongWords();
-    const head = `<div class="topbar"><button class="icon-btn" data-action="home" aria-label="ホームへ戻る">${ICON.back}</button><h1 tabindex="-1" data-title>間違えた単語</h1><span class="count num">${list.length}語</span></div>`;
-    if (!list.length) {
-      return `<div class="screen">${head}
-        <div class="empty"><h2>復習する単語はありません</h2><p>テストで間違えた単語がここに集まり、再テストで正解すると消えます。</p></div>
-        <div class="actions"><button class="btn btn-primary" data-action="home">ホームへ</button></div></div>`;
+  function setResultVerdict(r, newVerdict) {
+    var wasWrong = r.verdict === "wrong";
+    var isWrong = newVerdict === "wrong";
+    r.verdict = newVerdict;
+    rewriteLastHistoryMark(r.no, isWrong ? "×" : "○");
+    setLearned(r.no, !isWrong);
+    var session = state.test.currentInputSession;
+    if (session) {
+      var it = (session.items || []).filter(function (x) { return x.no === r.no; })[0];
+      if (it) { it.verdict = newVerdict; it.mark = isWrong ? "×" : "○"; }
+      adjustCycleForVerdictChange(session.cycleKey, session.lap, r.no, wasWrong, isWrong);
     }
-    const sorted = list.slice().sort((a, b) => state.wrong[wid(b)].localeCompare(state.wrong[wid(a)]));
-    return `<div class="screen">${head}
-      <div class="actions" style="margin:1rem 0 0.5rem">
-        <button class="btn btn-primary" data-action="start-retest">再テストを始める${list.length > TEST_LEN ? `（${TEST_LEN}問）` : ''}</button>
-      </div>
-      <ul class="list">${sorted.map(w => `<li>
-        <div class="row"><span class="en">${esc(w.word)}</span><span class="meta num">セット${w.set}・${fmtDate(state.wrong[wid(w)])}</span></div>
-        <span class="m">${esc(w.meaning)}</span><span class="h">${esc(w.hint)}</span></li>`).join('')}</ul>
-    </div>`;
   }
 
-  /* ---------- イベント ---------- */
-  app.addEventListener('click', e => {
-    const el = e.target.closest('[data-action]');
-    if (!el || el.disabled) return;
-    const a = el.dataset.action, s = parseInt(el.dataset.set, 10);
-    switch (a) {
-      case 'home': go('#/'); break;
-      case 'study': study = null; go('#/study/' + s); break;
-      case 'wrong': go('#/wrong'); break;
-      case 'start-test': startTest('set', s); break;
-      case 'start-retest': startTest('retest'); break;
-      case 'restart': session.kind === 'retest' ? startTest('retest') : startTest('set', session.set); break;
-      case 'quit-test': session = null; go('#/'); break;
-      case 'flip': flipCard(); break;
-      case 'learned': toggleLearned(); break;
-      case 'prev': moveStudy(-1); break;
-      case 'next': moveStudy(1); break;
-      case 'filter': startStudy(study.set, el.dataset.filter); render(); break;
-      case 'answer': answer(parseInt(el.dataset.idx, 10)); break;
-      case 'next-q': nextQ(); break;
-    }
+  function manualSetVerdict(no, newVerdict) {
+    var r = state.test.inputResults.filter(function (x) { return x.no === no; })[0];
+    if (!r || r.verdict === newVerdict) return;
+    r.manual = true;
+    setResultVerdict(r, newVerdict);
+    syncCurrentInputSessionScore();
+    renderInputResult({ shakeNo: newVerdict === "wrong" ? no : null });
+  }
+
+  function gradeInputTest() {
+    showAiNote(false);
+    var confirmedNos = [], wrongNos = [];
+    var results = state.test.inputQuestions.map(function (q) {
+      var g = gradeAnswer(q.answer, q.meaning);
+      var wrong = g.verdict === "wrong";
+      appendHistory(q.no, wrong ? "×" : "○");
+      setLearned(q.no, !wrong);
+      confirmedNos.push(q.no);
+      if (wrong) wrongNos.push(q.no);
+      return { no: q.no, word: q.word, pos: q.pos, meaning: q.meaning, answer: q.answer, verdict: g.verdict };
+    });
+    state.test.inputResults = results;
+    state.test.phase = "inputResult";
+    clearInputDraft();
+    var stats = computeInputStats(results);
+    var key = state.test.activeCycleKey, lap = state.test.activeCycleLap;
+    state.test.currentInputSession = addSession({
+      id: makeSessionId(), source: "app", type: "input", at: new Date().toISOString(),
+      ranges: sessionRangesFromNos(results.map(function (r) { return r.no; })),
+      total: stats.total, correct: stats.good,
+      cycleKey: key || null, lap: lap || null,
+      items: results.map(sessionItemFrom)
+    });
+    reconcileCycleAfterTest(key, confirmedNos, wrongNos, []);
+    updateTestPhaseVisibility();
+    window.scrollTo(0, 0);
+    renderInputResult({ graded: true });
+    if (lastSaveOk) showToast(stats.acc >= CONFETTI_THRESHOLD ? "お見事！記録を保存しました" : "記録を保存しました");
+    maybeRunAiCheck(results);
+  }
+
+  $("inputGradeBtn").addEventListener("click", gradeInputTest);
+  $("continueInputBtn").addEventListener("click", startWithLoading);
+  $("backToSetupInputBtn").addEventListener("click", function () {
+    state.test.phase = "setup";
+    renderTestSetup();
+  });
+  $("abortInputBtn").addEventListener("click", function () {
+    if (!window.confirm("テストを中断しますか？")) return;
+    abortInputTest();
   });
 
-  // スワイプで前後へ
-  let tx = 0, ty = 0;
-  app.addEventListener('touchstart', e => { if (e.target.closest('#card')) { tx = e.touches[0].clientX; ty = e.touches[0].clientY; } else tx = 0; }, { passive: true });
-  app.addEventListener('touchend', e => {
-    if (!tx || !study) return;
-    const dx = e.changedTouches[0].clientX - tx, dy = e.changedTouches[0].clientY - ty;
-    tx = 0;
-    if (Math.abs(dx) > 60 && Math.abs(dy) < 50) moveStudy(dx < 0 ? 1 : -1);
-  }, { passive: true });
+  // ---------- AI再判定（OpenAI・任意） ----------
+  function openaiKey() { try { return localStorage.getItem(OPENAI_KEY) || ""; } catch (e) { return ""; } }
 
-  document.addEventListener('keydown', e => {
-    if (!study || route().name !== 'study' || !study.deck.length) return;
-    if (e.key === 'ArrowRight') moveStudy(1);
-    else if (e.key === 'ArrowLeft') moveStudy(-1);
+  function buildAiPrompt(items) {
+    var lines = items.map(function (it, idx) {
+      return (idx + 1) + ". word: " + it.word + " / official meaning: " + it.meaning + " / user answer: " + it.answer;
+    });
+    return "以下は英単語テストの採点結果です。各項目について、ユーザーの回答(user answer)が、その単語の公式な意味(official meaning)として妥当かどうかを判定してください。" +
+      "厳密な完全一致でなくても、意味的に正しい、または許容できる言い換え・類義語であれば妥当とみなしてください。" +
+      "次のJSON形式で、項目数と順序を保ったまま回答してください（説明文は不要です）: " +
+      "{\"results\":[{\"index\": 1, \"acceptable\": true}, ...]}\n\n" + lines.join("\n");
+  }
+
+  function callOpenAI(apiKey, promptText) {
+    return fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": "Bearer " + apiKey },
+      body: JSON.stringify({
+        model: OPENAI_MODEL,
+        messages: [
+          { role: "system", content: "あなたは英単語テストの採点補助です。指定されたJSONだけを返してください。" },
+          { role: "user", content: promptText }
+        ],
+        response_format: { type: "json_object" },
+        max_completion_tokens: 400,
+        reasoning_effort: "none"
+      })
+    }).then(function (res) {
+      if (!res.ok) { var err = new Error("openai http " + res.status); err.status = res.status; throw err; }
+      return res.json();
+    }).then(function (data) {
+      var text = data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
+      return JSON.parse(text);
+    });
+  }
+
+  function aiFailMessage(e) {
+    var status = e && e.status;
+    if (status === 401) return "APIキーが正しくありません（OpenAIで有効か確認して入れ直してください）";
+    if (status === 429) return "APIの利用上限か残高不足です";
+    return "AI判定は使えませんでした";
+  }
+
+  function applyAiResults(parsed, items) {
+    var list = Array.isArray(parsed) ? parsed : (parsed && Array.isArray(parsed.results) ? parsed.results : null);
+    if (!list) { showAiNote(true); return; }
+    showAiNote(false);
+    list.forEach(function (entry) {
+      if (!entry || typeof entry.index !== "number" || entry.acceptable !== true) return;
+      var item = items[entry.index - 1];
+      if (!item) return;
+      var r = state.test.inputResults.filter(function (x) { return x.no === item.no; })[0];
+      if (r && r.verdict === "wrong" && !r.manual) {   // 手動で変更した判定は上書きしない
+        r.aiChecked = true;
+        setResultVerdict(r, "correct");
+      }
+    });
+    syncCurrentInputSessionScore();
+    if (state.test.phase === "inputResult") renderInputResult();
+  }
+
+  function maybeRunAiCheck(results) {
+    var wrongs = results.filter(function (r) { return r.verdict === "wrong"; });
+    if (!wrongs.length) return;
+    var key = openaiKey();
+    if (!key) { showAiNote(true, "設定でOpenAIのAPIキーを入れると、不正解の回答をAIが再確認します"); return; }
+    var items = wrongs.map(function (r) { return { no: r.no, word: r.word, answer: r.answer || "", meaning: r.meaning }; });
+    var session = state.test.currentInputSession;
+    showAiNote(true, "AIが不正解の回答を確認しています…", true);
+    callOpenAI(key, buildAiPrompt(items)).then(function (parsed) {
+      // 結果が返る前に別のテストへ移っていたら反映しない
+      if (state.test.currentInputSession !== session) return;
+      applyAiResults(parsed, items);
+    }).catch(function (e) {
+      if (state.test.currentInputSession === session) showAiNote(true, aiFailMessage(e));
+    });
+  }
+
+  function refreshOpenaiKeyUI() {
+    var hasKey = !!openaiKey();
+    var input = $("openaiKeyInput");
+    input.placeholder = hasKey ? "保存済み" : "APIキーを入力";
+    input.value = "";
+    $("openaiKeyDeleteBtn").style.display = hasKey ? "" : "none";
+    $("openaiKeyStatus").textContent = hasKey ? "保存済みのキーがあります" : "未設定です（なくても動作します）";
+  }
+  $("openaiKeySaveBtn").addEventListener("click", function () {
+    var v = $("openaiKeyInput").value.trim();
+    if (!v) return;
+    try { localStorage.setItem(OPENAI_KEY, v); } catch (e) {}
+    refreshOpenaiKeyUI();
+    showToast("APIキーを保存しました");
+  });
+  $("openaiKeyDeleteBtn").addEventListener("click", function () {
+    try { localStorage.removeItem(OPENAI_KEY); } catch (e) {}
+    refreshOpenaiKeyUI();
+    showToast("APIキーを削除しました");
   });
 
-  window.addEventListener('hashchange', render);
-  render();
+  // ---------- 進み具合 ----------
+  function renderProgress() {
+    var totalLearned = ALL_WORDS.filter(function (w) { return isLearned(w.no); }).length;
+    $("progOverallText").textContent = totalLearned + " / " + ALL_WORDS.length;
+    $("progOverallBar").style.width = (ALL_WORDS.length ? totalLearned / ALL_WORDS.length * 100 : 0) + "%";
+
+    var learnedWrap = $("progRangeLearned");
+    learnedWrap.innerHTML = "";
+    RANGES.forEach(function (r) {
+      var words = wordsInRange(r);
+      var learned = words.filter(function (w) { return isLearned(w.no); }).length;
+      var pct = words.length ? learned / words.length * 100 : 0;
+      var block = document.createElement("div");
+      block.className = "range-progress-block";
+      block.innerHTML =
+        '<div class="bar-row" style="margin-bottom:0;">' +
+        '<div class="bar-label"><span class="nm">' + rangeLabel(r) + ' (No.' + r + ')</span><span class="vv">チェック済み ' + learned + ' / ' + words.length + '</span></div>' +
+        '<div class="bar-track"><div class="bar-fill" style="width:' + pct + '%"></div></div></div>' +
+        '<div class="range-sub-rows"><div class="range-sub-row">未チェック: <b>' + (words.length - learned) + ' / ' + words.length + '語</b></div>' +
+        cycleGroupHtml(cycleStatusInfo(r + "|unchecked"), "未チェックの周回") +
+        cycleGroupHtml(cycleStatusInfo(r + "|all"), "全部の周回") + '</div>';
+      learnedWrap.appendChild(block);
+    });
+
+    var accWrap = $("progRangeAccuracy");
+    accWrap.innerHTML = "";
+    RANGES.forEach(function (r) {
+      var totalMarks = 0, correctMarks = 0;
+      wordsInRange(r).forEach(function (w) {
+        var h = getHistory(w.no);
+        for (var i = 0; i < h.length; i++) { totalMarks++; if (h.charAt(i) === "○") correctMarks++; }
+      });
+      var row = document.createElement("div");
+      row.className = "bar-row";
+      var acc = totalMarks ? Math.round(correctMarks / totalMarks * 100) : 0;
+      row.innerHTML = '<div class="bar-label"><span class="nm">' + rangeLabel(r) + ' (No.' + r + ')</span><span class="vv">' +
+        (totalMarks ? acc + '%（' + correctMarks + '/' + totalMarks + '）' : 'まだなし') + '</span></div>' +
+        '<div class="bar-track"><div class="bar-fill acc" style="width:' + acc + '%"></div></div>';
+      accWrap.appendChild(row);
+    });
+
+    renderCalendar();
+    renderSessionList();
+  }
+
+  function sessionTimestamp(s) {
+    var t = s.at ? Date.parse(s.at) : NaN;
+    return isNaN(t) ? -Infinity : t;
+  }
+  function sessionLabel(s) {
+    var ranges = (s.ranges && s.ranges.length) ? s.ranges.map(function (r) { return RANGES.indexOf(r) >= 0 ? rangeLabel(r) : r; }).join("・") : "";
+    return (ranges ? ranges + " ・ " : "") + (s.type === "input" ? "入力" : (s.type || ""));
+  }
+  function pad2(n) { return String(n).padStart(2, "0"); }
+  function sessionDateLabel(s) {
+    if (s.at) {
+      var d = new Date(s.at);
+      if (!isNaN(d.getTime())) return d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate()) + " " + pad2(d.getHours()) + ":" + pad2(d.getMinutes());
+    }
+    return "日付不明";
+  }
+  function scoreText(s) {
+    return (typeof s.correct === "number" && typeof s.total === "number") ? s.correct + " / " + s.total : "正解数の記録なし";
+  }
+  function buildSessionDetailHtml(s) {
+    if (!Array.isArray(s.items) || !s.items.length) {
+      return '<p class="empty-msg" style="padding:10px 0;">この回の単語ごとの記録はありません</p>';
+    }
+    return '<div class="session-items">' + s.items.map(function (it) {
+      var w = wordByNo[it.no];
+      var ans = (it.answer && String(it.answer).trim() !== "") ? it.answer : "（未回答）";
+      return '<div class="sess-item-row"><div><span class="sess-item-no">No.' + escapeHtml(it.no) + '</span>' +
+        '<span class="sess-item-mark ' + (it.mark === "○" ? "hist-good" : "hist-bad") + '">' + escapeHtml(it.mark || "") + '</span>' +
+        '<span class="sess-item-word">' + escapeHtml(it.word || (w ? w.word : "")) + '</span></div>' +
+        '<div class="sess-item-meaning">' + escapeHtml(it.meaning || (w ? w.meaning : "")) + '</div>' +
+        '<div class="sess-item-answer">回答: ' + escapeHtml(ans) + '</div></div>';
+    }).join("") + '</div>';
+  }
+
+  // 学習カレンダー（Asia/Tokyo）
+  var TOKYO_DATE_FMT = (function () {
+    try { return new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Tokyo", year: "numeric", month: "2-digit", day: "2-digit" }); }
+    catch (e) { return null; }
+  })();
+  function tokyoDateKeyFromDate(d) {
+    if (!TOKYO_DATE_FMT || isNaN(d.getTime())) return null;
+    return TOKYO_DATE_FMT.format(d);
+  }
+  function tokyoTodayKey() { return tokyoDateKeyFromDate(new Date()); }
+  function sessionDateKeyFor(s) {
+    if (s && s.at) { var d = new Date(s.at); if (!isNaN(d.getTime())) return tokyoDateKeyFromDate(d); }
+    return null;
+  }
+  function buildSessionDayMap() {
+    var map = {}, unknownCount = 0;
+    progress.sessions.forEach(function (s) {
+      var key = sessionDateKeyFor(s);
+      if (!key) { unknownCount++; return; }
+      if (!map[key]) map[key] = { sessions: [], totalItems: 0 };
+      map[key].sessions.push(s);
+      map[key].totalItems += (typeof s.total === "number") ? s.total : (Array.isArray(s.items) ? s.items.length : 0);
+    });
+    return { map: map, unknownCount: unknownCount };
+  }
+  function calDotsCount(n) { return n <= 0 ? 0 : (n < 10 ? 1 : (n < 20 ? 2 : 3)); }
+  function addDaysToKey(key, delta) {
+    var p = key.split("-").map(Number);
+    var d = new Date(p[0], p[1] - 1, p[2]);
+    d.setDate(d.getDate() + delta);
+    return d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate());
+  }
+  function computeStreak(dayMap, todayKey) {
+    if (!todayKey) return 0;
+    var cur = dayMap.map[todayKey] ? todayKey : addDaysToKey(todayKey, -1);
+    var streak = 0;
+    while (dayMap.map[cur]) { streak++; cur = addDaysToKey(cur, -1); }
+    return streak;
+  }
+
+  function renderCalendarDayDetail(dayMap) {
+    var wrap = $("calDayDetail");
+    var cs = state.progress.calendar;
+    if (!cs.selectedDate || !dayMap.map[cs.selectedDate]) { wrap.innerHTML = ""; return; }
+    var sessions = dayMap.map[cs.selectedDate].sessions.slice().sort(function (a, b) { return sessionTimestamp(b) - sessionTimestamp(a); });
+    var html = '<h3>' + escapeHtml(cs.selectedDate) + 'の記録</h3><ul class="session-list">';
+    sessions.forEach(function (s, idx) {
+      var sid = "cal-" + cs.selectedDate + "-" + idx;
+      html += '<li class="session-item"><div class="session-main-wrap" data-sid="' + sid + '"><div class="session-main"><span class="session-label">' +
+        escapeHtml(sessionLabel(s)) + '</span><span class="session-score">' + escapeHtml(scoreText(s)) + '</span></div></div>';
+      if (state.progress.expandedSessions[sid]) html += '<div class="session-detail">' + buildSessionDetailHtml(s) + '</div>';
+      html += '</li>';
+    });
+    wrap.innerHTML = html + '</ul>';
+    Array.prototype.forEach.call(wrap.querySelectorAll(".session-main-wrap"), function (el) {
+      el.addEventListener("click", function () {
+        var sid = el.getAttribute("data-sid");
+        state.progress.expandedSessions[sid] = !state.progress.expandedSessions[sid];
+        renderCalendarDayDetail(dayMap);
+      });
+    });
+  }
+
+  function renderCalendar() {
+    if (!state.progress.calendar) {
+      var tp = (tokyoTodayKey() || "1970-01-01").split("-");
+      state.progress.calendar = { year: parseInt(tp[0], 10), month: parseInt(tp[1], 10), selectedDate: null };
+    }
+    var cs = state.progress.calendar;
+    var dayMap = buildSessionDayMap();
+    var todayKey = tokyoTodayKey();
+    $("calTitle").textContent = cs.year + "年" + cs.month + "月";
+    $("calWeekdays").innerHTML = ["日", "月", "火", "水", "木", "金", "土"].map(function (n) {
+      return '<div class="cal-weekday">' + n + '</div>';
+    }).join("");
+
+    var grid = $("calGrid");
+    grid.innerHTML = "";
+    var firstWd = new Date(cs.year, cs.month - 1, 1).getDay();
+    var numDays = new Date(cs.year, cs.month, 0).getDate();
+    var monthDays = 0;
+    for (var i = 0; i < firstWd; i++) {
+      var padEl = document.createElement("div");
+      padEl.className = "cal-cell is-pad";
+      grid.appendChild(padEl);
+    }
+    for (var day = 1; day <= numDays; day++) {
+      var key = cs.year + "-" + pad2(cs.month) + "-" + pad2(day);
+      var info = dayMap.map[key];
+      if (info) monthDays++;
+      var cell = document.createElement(info ? "button" : "div");
+      if (info) cell.type = "button";
+      cell.className = "cal-cell" + (info ? " has-data" : "") + (key === todayKey ? " is-today" : "") + (cs.selectedDate === key ? " is-selected" : "");
+      var dots = "";
+      if (info) for (var di = 0; di < calDotsCount(info.totalItems); di++) dots += '<span class="cal-dot"></span>';
+      cell.innerHTML = '<span class="cal-daynum">' + day + '</span>' + (dots ? '<div class="cal-dots">' + dots + '</div>' : "");
+      if (info) {
+        cell.setAttribute("aria-label", key + "の記録を見る");
+        cell.addEventListener("click", (function (k) {
+          return function () { cs.selectedDate = (cs.selectedDate === k) ? null : k; renderCalendar(); };
+        })(key));
+      }
+      grid.appendChild(cell);
+    }
+    $("calSummary").innerHTML =
+      '<span>表示中の月の学習日数: <b>' + monthDays + '日</b></span>' +
+      '<span>連続学習日数: <b>' + computeStreak(dayMap, todayKey) + '日</b></span>';
+    var unknownEl = $("calUnknownMsg");
+    unknownEl.style.display = dayMap.unknownCount > 0 ? "" : "none";
+    if (dayMap.unknownCount > 0) unknownEl.textContent = "日付不明の記録が" + dayMap.unknownCount + "件あります";
+    renderCalendarDayDetail(dayMap);
+  }
+
+  $("calPrevBtn").addEventListener("click", function () {
+    var cs = state.progress.calendar;
+    cs.month -= 1;
+    if (cs.month < 1) { cs.month = 12; cs.year -= 1; }
+    cs.selectedDate = null;
+    renderCalendar();
+  });
+  $("calNextBtn").addEventListener("click", function () {
+    var cs = state.progress.calendar;
+    cs.month += 1;
+    if (cs.month > 12) { cs.month = 1; cs.year += 1; }
+    cs.selectedDate = null;
+    renderCalendar();
+  });
+
+  function renderSessionList() {
+    var wrap = $("progSessionList");
+    var sessions = progress.sessions.slice().sort(function (a, b) { return sessionTimestamp(b) - sessionTimestamp(a); });
+    wrap.innerHTML = "";
+    if (!sessions.length) {
+      wrap.innerHTML = '<p class="empty-msg" style="padding:12px 0;">まだ記録がありません</p>';
+      return;
+    }
+    var ul = document.createElement("ul");
+    ul.className = "session-list";
+    sessions.forEach(function (s, idx) {
+      var sid = s.id || ("idx-" + idx);
+      var li = document.createElement("li");
+      li.className = "session-item";
+      var main = document.createElement("div");
+      main.className = "session-main-wrap";
+      main.innerHTML = '<div class="session-date">' + escapeHtml(sessionDateLabel(s)) + '</div>' +
+        '<div class="session-main"><span class="session-label">' + escapeHtml(sessionLabel(s)) + '</span>' +
+        '<span class="session-score">' + escapeHtml(scoreText(s)) + '</span></div>';
+      main.addEventListener("click", function () {
+        state.progress.expandedSessions[sid] = !state.progress.expandedSessions[sid];
+        renderSessionList();
+      });
+      li.appendChild(main);
+      if (state.progress.expandedSessions[sid]) {
+        var detail = document.createElement("div");
+        detail.className = "session-detail";
+        detail.innerHTML = buildSessionDetailHtml(s);
+        li.appendChild(detail);
+      }
+      ul.appendChild(li);
+    });
+    wrap.appendChild(ul);
+  }
+
+  // ---------- 設定 ----------
+  $("themeSeg").addEventListener("click", function (e) {
+    var btn = e.target.closest(".seg-btn");
+    if (!btn) return;
+    try { localStorage.setItem(THEME_KEY, btn.getAttribute("data-theme-choice")); } catch (err) {}
+    applyTheme();
+  });
+
+  $("exportBtn").addEventListener("click", function () {
+    var blob = new Blob([JSON.stringify(progress, null, 2)], { type: "application/json" });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement("a");
+    var d = new Date();
+    a.href = url;
+    a.download = "eitango_progress_" + d.getFullYear() + pad2(d.getMonth() + 1) + pad2(d.getDate()) + ".json";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+    showToast("学習記録を書き出しました");
+  });
+
+  function showImportMsg(ok, text) {
+    var msg = $("importMsg");
+    msg.style.display = "";
+    msg.className = "import-msg " + (ok ? "ok" : "err");
+    msg.textContent = text;
+  }
+
+  $("importFile").addEventListener("change", function (e) {
+    var file = e.target.files && e.target.files[0];
+    var input = e.target;
+    if (!file) return;
+    var reader = new FileReader();
+    reader.onload = function () {
+      try {
+        var parsed = JSON.parse(String(reader.result));
+        if (!parsed || typeof parsed !== "object" ||
+            !parsed.learned || typeof parsed.learned !== "object" ||
+            !parsed.history || typeof parsed.history !== "object") {
+          throw new Error("invalid shape");
+        }
+        progress = normalizeProgress(parsed);
+        saveProgress();
+        clearInputDraft();
+        state.test.phase = "setup";
+        state.test.activeCycleKey = null;
+        reconcileReservedOnLoad();
+        showImportMsg(true, "読み込みました");
+        renderAll();
+        showToast("学習記録を読み込みました");
+      } catch (err) {
+        showImportMsg(false, "読み込みに失敗しました。ファイルの形式を確認してください。");
+      }
+    };
+    reader.onerror = function () { showImportMsg(false, "ファイルを読み込めませんでした。"); };
+    reader.readAsText(file);
+    input.value = "";
+  });
+
+  $("resetBtn").addEventListener("click", function () {
+    if (!window.confirm("学習記録をすべて消して最初の状態に戻します。よろしいですか？")) return;
+    var keptTips = progress.tips;
+    progress = normalizeProgress({ tips: keptTips });
+    saveProgress();
+    clearInputDraft();
+    state.test.phase = "setup";
+    state.test.activeCycleKey = null;
+    state.progress.expandedSessions = {};
+    renderAll();
+    showToast("学習記録をリセットしました");
+  });
+
+  function renderAll() {
+    renderList();
+    renderFlipChips();
+    flipBuildDeck();
+    renderTestSetup();
+    renderProgress();
+  }
+
+  // ---------- キーボード表示中はタブバーを隠す ----------
+  (function () {
+    var tabbarEl = $("tabbar");
+    function isFormFocused() {
+      var el = document.activeElement;
+      if (!el) return false;
+      if (el.tagName === "TEXTAREA") return true;
+      if (el.tagName === "INPUT") return el.type !== "checkbox" && el.type !== "radio";
+      return false;
+    }
+    function keyboardLikelyOpen() {
+      if (!window.visualViewport) return false;
+      return ((document.documentElement.clientHeight || window.innerHeight) - window.visualViewport.height) > 80;
+    }
+    function update() { tabbarEl.classList.toggle("is-hidden", isFormFocused() || keyboardLikelyOpen()); }
+    document.addEventListener("focusin", update);
+    document.addEventListener("focusout", function () { setTimeout(update, 0); });
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener("resize", update);
+      window.visualViewport.addEventListener("scroll", update);
+    }
+    window.addEventListener("resize", update);
+  })();
+
+  // ---------- ダブルタップ拡大の抑止（入力欄は除外） ----------
+  (function () {
+    var lastTouchEnd = 0;
+    function editable(el) {
+      if (!el) return false;
+      var t = el.tagName;
+      return t === "INPUT" || t === "TEXTAREA" || t === "SELECT" || el.isContentEditable;
+    }
+    document.addEventListener("touchend", function (e) {
+      if (editable(e.target)) return;
+      var now = Date.now();
+      if (now - lastTouchEnd <= 300) e.preventDefault();
+      lastTouchEnd = now;
+    }, { passive: false });
+    document.addEventListener("dblclick", function (e) { if (!editable(e.target)) e.preventDefault(); }, { passive: false });
+  })();
+
+  // ---------- 起動 ----------
+  loadProgress();
+  reconcileReservedOnLoad();
+  applyTheme();
+  $("appbarSub").textContent = ALL_WORDS.length + "語（セット1〜" + RANGES.length + "）";
+  switchTab("list");
+  booted = true; // 起動時の初回表示ではスタッガーしない
+  flipBuildDeck();
+  renderTestSetup();
+  renderProgress();
 })();
