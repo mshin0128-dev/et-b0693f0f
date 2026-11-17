@@ -222,6 +222,11 @@ li.word-row.is-learned .w-pos { color: var(--learned-fg); }
 .seg { display: flex; border: 1px solid var(--border); border-radius: 14px; padding: 4px; gap: 4px; background: var(--card); }
 .seg-btn { flex: 1; min-height: 40px; border-radius: 10px; border: none; background: transparent; color: var(--text); font-size: 14px; font-weight: 600; }
 .seg-btn.active { background: var(--tab-pill-bg); color: var(--accent); }
+.seg-btn .seg-label { display: block; line-height: 1.25; }
+.seg-btn .seg-sub { display: block; margin-top: 1px; font-size: 11px; font-weight: 600; line-height: 1.2; color: var(--sub); }
+.seg-btn.active .seg-sub { color: var(--accent); opacity: .85; }
+.range-lap-line { font-size: 12px; color: var(--sub); margin-top: 2px; }
+.range-lap-line b { color: var(--text); font-weight: 700; }
 
 .field { margin-bottom: 14px; }
 .field label.field-label { display: block; font-size: 13px; color: var(--sub); margin-bottom: 6px; font-weight: 600; }

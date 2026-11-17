@@ -31,7 +31,7 @@
   ALL_WORDS.forEach(function (w) { wordByNo[w.no] = w; });
 
   var DEFAULT_DAILY_GOAL = 20;
-  var progress = { learned: {}, history: {}, sessions: [], cycles: {}, tips: {}, days: {}, settings: { dailyGoal: DEFAULT_DAILY_GOAL }, flags: {}, srs: {} };
+  var progress = { learned: {}, history: {}, sessions: [], cycles: {}, tips: {}, days: {}, settings: { dailyGoal: DEFAULT_DAILY_GOAL }, flags: {}, srs: {}, checkedAt: {} };
 
   function $(id) { return document.getElementById(id); }
   function hasOwn(o, k) { return Object.prototype.hasOwnProperty.call(o, k); }
@@ -169,9 +169,12 @@
     });
     var cycles = {};
     var sc = (saved.cycles && typeof saved.cycles === "object") ? saved.cycles : {};
-    Object.keys(sc).forEach(function (key) {
-      var c = sc[key];
+    Object.keys(sc).forEach(function (rawKey) {
+      var c = sc[rawKey];
       if (!c || typeof c !== "object") return;
+      // 旧データ（範囲×対象）は 英→日 の周回として引き継ぐ。新形式の同名キーがあればそちらを優先。
+      var key = normalizeCycleKey(rawKey);
+      if (key !== rawKey && hasOwn(sc, key)) return;
       cycles[key] = {
         lap: (typeof c.lap === "number" && c.lap >= 1) ? c.lap : 1,
         remaining: numList(c.remaining),
@@ -203,7 +206,20 @@
     Object.keys(sf).forEach(function (k) { if (sf[k] === true && wordByNo[k]) flags[k] = true; });
     // 間隔反復: { 単語番号: { stage, due, last, pending, prev? } }。保存に無い語は履歴から遅延初期化する。
     var srs = normalizeSrs(saved.srs, history, sessions);
-    return { learned: learned, history: history, sessions: sessions, cycles: cycles, tips: tips, days: days, settings: { dailyGoal: goal }, flags: flags, srs: srs, migrations: {} };
+    // 覚えた日: { 単語番号: "YYYY-MM-DD"(端末のローカル日付) }。チェック中の語だけ持つ。
+    // 古いデータには無いので、その語を含む最新の学習日（days）から補う。
+    var checkedAt = {};
+    var sca = (saved.checkedAt && typeof saved.checkedAt === "object" && !Array.isArray(saved.checkedAt)) ? saved.checkedAt : {};
+    var dayKeys = Object.keys(days).sort();
+    ALL_WORDS.forEach(function (w) {
+      if (!learned[w.no]) return;
+      var v = hasOwn(sca, w.no) ? sca[w.no] : null;
+      if (typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v)) { checkedAt[w.no] = v; return; }
+      for (var i = dayKeys.length - 1; i >= 0; i--) {
+        if (days[dayKeys[i]].indexOf(w.no) !== -1) { checkedAt[w.no] = dayKeys[i]; return; }
+      }
+    });
+    return { learned: learned, history: history, sessions: sessions, cycles: cycles, tips: tips, days: days, settings: { dailyGoal: goal }, flags: flags, srs: srs, checkedAt: checkedAt, migrations: {} };
   }
 
   // ---------- 間隔反復（忘却曲線） ----------
@@ -292,7 +308,7 @@
 
   function reconcileReservedOnLoad() {
     var draft = loadInputDraft();
-    var keepKey = draft ? draft.activeCycleKey : null;
+    var keepKey = draft ? normalizeCycleKey(draft.activeCycleKey) : null;
     var keepNos = {};
     if (draft && Array.isArray(draft.questions)) draft.questions.forEach(function (q) { keepNos[q.no] = true; });
     var changed = false;
@@ -314,7 +330,9 @@
   function getHistory(no) { return progress.history[no] || ""; }
   function setLearned(no, val) {
     progress.learned[no] = !!val;
-    if (val) noteStudied(no);
+    if (!progress.checkedAt) progress.checkedAt = {};
+    if (val) { noteStudied(no); progress.checkedAt[no] = localDateKey(new Date()); }
+    else delete progress.checkedAt[no];
     saveProgress();
     renderStudyStats();
   }
@@ -336,7 +354,12 @@
     if (!Array.isArray(arr)) arr = progress.days[key] = [];
     if (arr.indexOf(no) === -1) arr.push(no);
   }
-  function todayCount() { var a = progress.days && progress.days[todayKey()]; return Array.isArray(a) ? a.length : 0; }
+  // 今日の学習語数 = 今チェックが付いている語のうち、チェックした日が今日（ローカル日付）のもの。状態から毎回数える。
+  function todayCount() {
+    var ca = progress.checkedAt || {}, today = localDateKey(new Date()), n = 0;
+    ALL_WORDS.forEach(function (w) { if (progress.learned[w.no] && ca[w.no] === today) n++; });
+    return n;
+  }
   function dailyGoal() {
     var g = progress.settings && progress.settings.dailyGoal;
     return (typeof g === "number" && g >= 1) ? g : DEFAULT_DAILY_GOAL;
@@ -561,8 +584,33 @@
     if (sorted.length === RANGES.length && RANGES.every(function (r) { return sorted.indexOf(r) !== -1; })) return "ALL";
     return sorted.join(",");
   }
+  // 周回キー = 範囲 | 対象(unchecked/all) | 形式(en-ja/ja-en/cloze)。旧形式（形式なし）は en-ja 扱い。
+  var LAP_FORMATS = [
+    { ui: "input", lap: "en-ja", label: "英→日 入力", short: "英→日" },
+    { ui: "jaen", lap: "ja-en", label: "日→英 入力", short: "日→英" },
+    { ui: "cloze", lap: "cloze", label: "例文穴埋め", short: "例文" }
+  ];
+  function lapFormatOfUi(ui) {
+    for (var i = 0; i < LAP_FORMATS.length; i++) if (LAP_FORMATS[i].ui === ui) return LAP_FORMATS[i];
+    return LAP_FORMATS[0];
+  }
+  function splitCycleKey(key) {
+    var p = String(key).split("|");
+    return { rangeKey: p[0], mode: p[1] || "all", fmt: p[2] || "en-ja" };
+  }
+  function makeCycleKey(rangeKey, mode, fmt) { return rangeKey + "|" + mode + "|" + fmt; }
+  function normalizeCycleKey(key) {
+    if (typeof key !== "string") return key;
+    var p = splitCycleKey(key);
+    return makeCycleKey(p.rangeKey, p.mode, p.fmt);
+  }
   function currentCycleKey() {
-    return normalizeRangeKeyForCycle() + "|" + (state.test.unlearnedOnly ? "unchecked" : "all");
+    return makeCycleKey(normalizeRangeKeyForCycle(), state.test.unlearnedOnly ? "unchecked" : "all", lapFormatOfUi(state.test.format).lap);
+  }
+  // 周回数（未開始は0）。状態は変更しない。
+  function lapNumberForKey(key) {
+    var c = progress.cycles[key];
+    return (c && c.everStarted && typeof c.lap === "number") ? c.lap : 0;
   }
   function wordsForRangeKey(rangeKey) {
     if (rangeKey === "ALL") return ALL_WORDS.slice();
@@ -572,9 +620,9 @@
     });
     return out;
   }
-  function cycleModeFromKey(key) { return key.slice(key.lastIndexOf("|") + 1); }
+  function cycleModeFromKey(key) { return splitCycleKey(key).mode; }
   function poolNosForKey(key) {
-    var rangeKey = key.slice(0, key.lastIndexOf("|"));
+    var rangeKey = splitCycleKey(key).rangeKey;
     var words = wordsForRangeKey(rangeKey);
     if (cycleModeFromKey(key) === "unchecked") words = words.filter(function (w) { return !isLearned(w.no); });
     return words.map(function (w) { return w.no; });
@@ -622,7 +670,7 @@
   function lapTotalForCycle(c, key) {
     if (typeof c.lapTotal === "number" && c.lapTotal > 0) return { total: c.lapTotal, reliable: true };
     if ((c.lap || 1) === 1 && cycleModeFromKey(key) === "all") {
-      return { total: wordsForRangeKey(key.slice(0, key.lastIndexOf("|"))).length, reliable: true };
+      return { total: wordsForRangeKey(splitCycleKey(key).rangeKey).length, reliable: true };
     }
     return { total: c.remaining.length + c.reserved.length + c.wrongLap.length, reliable: false };
   }
@@ -648,16 +696,19 @@
     }
     return info;
   }
-  function cycleGroupHtml(info, heading) {
+  // 進み具合用: 形式ごとの周回を1行で（例: 英→日 2周目 ・ 日→英 0周目 ・ 例文 1周目）。詳細行は 英→日 のみ。
+  function cycleGroupHtml(rangeKey, mode, heading) {
+    var info = cycleStatusInfo(makeCycleKey(rangeKey, mode, "en-ja"));
     var lines = ['<div class="range-sub-heading">' + escapeHtml(heading) + '</div>'];
     if (info.poolSize === 0) {
       lines.push('<div class="range-sub-row">対象の単語がありません</div>');
-    } else if (!info.everStarted) {
-      lines.push('<div class="range-sub-row">今の周回: <b>0周目</b>（' + info.poolSize + '語が対象）</div>');
-    } else {
-      lines.push('<div class="range-sub-row">今の周回: <b>' + info.lap + '周目</b></div>');
-      lines.push('<div class="range-sub-row">テスト済み: <b>' + info.tested + (info.lapTotalReliable ? ' / ' + info.lapTotal : '') + '語</b>（残り' + info.z + '語）</div>');
-      lines.push('<div class="range-sub-row">この周の×: <b>' + info.wrong + '語</b></div>');
+      return lines.join("");
+    }
+    lines.push('<div class="range-lap-line">' + LAP_FORMATS.map(function (f) {
+      return escapeHtml(f.short) + ' <b>' + lapNumberForKey(makeCycleKey(rangeKey, mode, f.lap)) + '周目</b>';
+    }).join(' ・ ') + '</div>');
+    if (info.everStarted) {
+      lines.push('<div class="range-sub-row">英→日 テスト済み: <b>' + info.tested + (info.lapTotalReliable ? ' / ' + info.lapTotal : '') + '語</b>（残り' + info.z + '語）・ この周の×: <b>' + info.wrong + '語</b></div>');
     }
     return lines.join("");
   }
@@ -674,7 +725,7 @@
   }
   function adjustCycleForVerdictChange(key, lap, no, wasWrong, isWrong) {
     if (!key || wasWrong === isWrong) return;
-    var c = progress.cycles[key];
+    var c = progress.cycles[normalizeCycleKey(key)];
     if (!c || c.lap !== lap) return;
     if (wasWrong && !isWrong) {
       var idx = c.wrongLap.indexOf(no);
@@ -1213,7 +1264,8 @@
 
   function renderCycleStatus() {
     var key = currentCycleKey();
-    var rangeKey = key.slice(0, key.lastIndexOf("|"));
+    var rangeKey = splitCycleKey(key).rangeKey;
+    var fmtShort = lapFormatOfUi(state.test.format).short;
     var c = getCycle(key);
     advanceLapIfPossible(c, cycleModeFromKey(key), poolNosForKey(key));
     saveProgress();
@@ -1223,9 +1275,9 @@
     if (info.poolSize === 0) {
       rows.push('<div class="cycle-row">対象の単語がありません。</div>');
     } else if (!info.everStarted) {
-      rows.push('<div class="cycle-row">今の周回: <span class="cv">0周目</span>（開始すると1周目、' + info.poolSize + '語が対象）</div>');
+      rows.push('<div class="cycle-row">今の周回（' + fmtShort + '）: <span class="cv">0周目</span>（開始すると1周目、' + info.poolSize + '語が対象）</div>');
     } else {
-      rows.push('<div class="cycle-row">今の周回: <span class="cv">' + info.lap + '周目</span></div>');
+      rows.push('<div class="cycle-row">今の周回（' + fmtShort + '）: <span class="cv">' + info.lap + '周目</span></div>');
       rows.push('<div class="cycle-row">この周のテスト済み: <span class="cv">' + info.tested + (info.lapTotalReliable ? ' / ' + info.lapTotal : '') + '語</span>（残り' + info.z + '語）</div>');
       rows.push('<div class="cycle-row">この周の×: <span class="cv">' + info.wrong + '語</span></div>');
     }
@@ -1258,16 +1310,24 @@
     var flaggedN = flaggedNosInRange().length;
     $("testFlaggedBtn").textContent = "★フラグのみ（" + flaggedN + "）";
 
-    Array.prototype.forEach.call($("testFormatSeg").querySelectorAll(".seg-btn"), function (btn) {
-      btn.classList.toggle("active", btn.getAttribute("data-format") === state.test.format);
-    });
     var review = state.test.review, rn = reviewNos().length;
+    // 形式ボタン: 選択中の範囲×対象での各形式の周回を小さく添える（復習・★フラグでは周回を使わないので出さない）
+    var showLapCaption = !review && !state.test.flaggedOnly;
+    var capRange = normalizeRangeKeyForCycle(), capMode = state.test.unlearnedOnly ? "unchecked" : "all";
+    Array.prototype.forEach.call($("testFormatSeg").querySelectorAll(".seg-btn"), function (btn) {
+      var f = lapFormatOfUi(btn.getAttribute("data-format"));
+      var lap = lapNumberForKey(makeCycleKey(capRange, capMode, f.lap));
+      btn.classList.toggle("active", f.ui === state.test.format);
+      btn.innerHTML = '<span class="seg-label">' + escapeHtml(f.label) + '</span>' +
+        (showLapCaption ? '<span class="seg-sub">' + (lap > 0 ? lap + '周目' : '未開始') + '</span>' : '');
+    });
+    $("testFormatField").style.display = review ? "none" : ""; // 復習は 英→日 入力で行う
     $("testRangeField").style.display = review ? "none" : "";
     $("testTargetField").style.display = review ? "none" : "";
     var flaggedMode = !review && state.test.flaggedOnly;
     $("testCycleCard").style.display = (review || flaggedMode) ? "none" : "";
     $("reviewInfo").innerHTML = review
-      ? '<b>今日の復習モード</b>: ×の単語と復習期限が来た単語 ' + rn + '語から出題します（全セット対象）。'
+      ? '<b>今日の復習モード</b>: ×の単語と復習期限が来た単語 ' + rn + '語から、英→日 入力で出題します（全セット対象）。'
       : '今日の復習（×の単語＋期限が来た単語）: <b>' + rn + '語</b>（全セット対象）';
     var noFlagged = flaggedMode && flaggedN === 0;
     $("testStartBtn").disabled = noFlagged;
@@ -1299,7 +1359,7 @@
     renderTestSetup();
   });
   $("cycleResetBtn").addEventListener("click", function () {
-    if (!window.confirm("この範囲×対象の周回をリセットします。よろしいですか？")) return;
+    if (!window.confirm("この範囲×対象×形式（" + lapFormatOfUi(state.test.format).label + "）の周回をリセットします。よろしいですか？")) return;
     delete progress.cycles[currentCycleKey()];
     saveProgress();
     renderTestSetup();
@@ -1399,10 +1459,12 @@
   var VERDICT_LABELS = { correct: "正解", close: "近い（正解扱い）", wrong: "不正解" };
   var VERDICT_CLASSES = { correct: "v-correct", close: "v-close", wrong: "v-wrong" };
 
-  // 形式: input=英→日 入力 / jaen=日→英 入力 / cloze=例文穴埋め（4択）。履歴・習得・セッション・周回は全形式で共通。
+  // 形式: input=英→日 入力 / jaen=日→英 入力 / cloze=例文穴埋め（4択）。周回は形式ごと / セッション記録は全形式 / 履歴・習得・SRS は input のみ。
   var FORMATS = ["input", "jaen", "cloze"];
   var FORMAT_SESSION_LABELS = { input: "入力", jaen: "日→英", cloze: "穴埋め" };
   function validFormat(f) { return FORMATS.indexOf(f) !== -1 ? f : "input"; }
+  // 習得記録（履歴・正答率・覚えた・SRS・今日の語数）を作るのは 英→日 入力だけ。他の形式は周回の進みとセッション記録のみ。
+  function buildsMastery() { return state.test.runFormat === "input"; }
 
   function escapeRegExp(s) { return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
   // 例文中の対象語（活用形を含む）を ＿＿＿ に置き換える。見つからなければ null。
@@ -1456,7 +1518,8 @@
   }
 
   function startInputTest(chosen) {
-    var fmt = state.test.runFormat = validFormat(state.test.format);
+    // 今日の復習は習得記録（SRS）を更新できる 英→日 入力で固定
+    var fmt = state.test.runFormat = state.test.review ? "input" : validFormat(state.test.format);
     state.test.inputQuestions = chosen.map(function (w) {
       var q = { no: w.no, word: w.word, pos: w.pos, meaning: w.meaning, answer: "" };
       if (fmt === "cloze") q.choices = buildChoices(w);
@@ -1650,7 +1713,7 @@
       state.test.flaggedOnly = draft.settings.flaggedOnly === true;
       if (draft.settings.count) state.test.count = draft.settings.count;
     }
-    state.test.activeCycleKey = draft.activeCycleKey || null;
+    state.test.activeCycleKey = draft.activeCycleKey ? normalizeCycleKey(draft.activeCycleKey) : null;
     state.test.activeCycleLap = draft.activeCycleLap || null;
     state.test.runFormat = validFormat(draft.settings && draft.settings.format);
     state.test.format = state.test.runFormat;
@@ -1696,8 +1759,7 @@
       var items = answered.map(function (q) {
         var g = gradeQuestion(q, state.test.runFormat);
         var wrong = g.verdict === "wrong";
-        appendHistory(q.no, wrong ? "×" : "○");
-        setLearned(q.no, !wrong);
+        if (buildsMastery()) { appendHistory(q.no, wrong ? "×" : "○"); setLearned(q.no, !wrong); }
         if (wrong) wrongNos.push(q.no); else correctCount++;
         return sessionItemFrom({ no: q.no, word: q.word, meaning: q.meaning, pos: q.pos, answer: q.answer, verdict: g.verdict });
       });
@@ -1827,8 +1889,10 @@
     var wasWrong = r.verdict === "wrong";
     var isWrong = newVerdict === "wrong";
     r.verdict = newVerdict;
-    rewriteLastHistoryMark(r.no, isWrong ? "×" : "○");
-    setLearned(r.no, !isWrong);
+    if (buildsMastery()) {
+      rewriteLastHistoryMark(r.no, isWrong ? "×" : "○");
+      setLearned(r.no, !isWrong);
+    }
     var session = state.test.currentInputSession;
     if (session) {
       var it = (session.items || []).filter(function (x) { return x.no === r.no; })[0];
@@ -1852,8 +1916,7 @@
     var results = state.test.inputQuestions.map(function (q) {
       var g = gradeQuestion(q, state.test.runFormat);
       var wrong = g.verdict === "wrong";
-      appendHistory(q.no, wrong ? "×" : "○");
-      setLearned(q.no, !wrong);
+      if (buildsMastery()) { appendHistory(q.no, wrong ? "×" : "○"); setLearned(q.no, !wrong); }
       confirmedNos.push(q.no);
       if (wrong) wrongNos.push(q.no);
       return { no: q.no, word: q.word, pos: q.pos, meaning: q.meaning, answer: q.answer, verdict: g.verdict };
@@ -2008,8 +2071,8 @@
         '<div class="bar-label"><span class="nm">' + rangeLabel(r) + ' (No.' + r + ')</span><span class="vv">チェック済み ' + learned + ' / ' + words.length + '</span></div>' +
         '<div class="bar-track"><div class="bar-fill" style="width:' + pct + '%"></div></div></div>' +
         '<div class="range-sub-rows"><div class="range-sub-row">未チェック: <b>' + (words.length - learned) + ' / ' + words.length + '語</b></div>' +
-        cycleGroupHtml(cycleStatusInfo(r + "|unchecked"), "未チェックの周回") +
-        cycleGroupHtml(cycleStatusInfo(r + "|all"), "全部の周回") + '</div>';
+        cycleGroupHtml(r, "unchecked", "未チェックの周回") +
+        cycleGroupHtml(r, "all", "全部の周回") + '</div>';
       learnedWrap.appendChild(block);
     });
 
@@ -2282,6 +2345,7 @@
     if (hasOwn(p, "days") && !isPlainObject(p.days)) return "days";
     if (hasOwn(p, "flags") && !isPlainObject(p.flags)) return "flags";
     if (hasOwn(p, "srs") && !isPlainObject(p.srs)) return "srs";
+    if (hasOwn(p, "checkedAt") && !isPlainObject(p.checkedAt)) return "checkedAt";
     if (hasOwn(p, "settings") && !isPlainObject(p.settings)) return "settings";
     return null;
   }
