@@ -174,12 +174,14 @@
 
   // ---------- 保存 / 読み込み ----------
   var lastSaveOk = true;
+  var wordsMissing = (ALL_WORDS.length === 0); // words.js が読めなかった時は保存データに一切触らない
   function showStorageNotice(show) {
     var el = $("notice");
     if (el) el.hidden = !show;
   }
 
   function saveProgress() {
+    if (wordsMissing) return; // 単語ゼロの状態で空の進捗を上書きしない
     try {
       localStorage.setItem(PROGRESS_KEY, JSON.stringify(progress));
       showStorageNotice(false);
@@ -336,6 +338,7 @@
   }
 
   function loadProgress() {
+    if (wordsMissing) return; // 単語データが無い時は読み込みも保存もしない（記録を保護）
     var raw = null;
     try { raw = localStorage.getItem(PROGRESS_KEY); } catch (e) { raw = null; }
     var parsed = null;
@@ -2510,6 +2513,10 @@
 
   // ---------- 起動 ----------
   loadProgress();
+  if (wordsMissing) {
+    var wn = $("notice");
+    if (wn) { wn.textContent = "単語データを読み込めませんでした。記録は保護されています。通信の良い場所でアプリを開き直してください。"; wn.hidden = false; }
+  }
   reconcileReservedOnLoad();
   applyTheme();
   $("appbarSub").textContent = "EITANGO · " + ALL_WORDS.length + " WORDS";
