@@ -1,6 +1,6 @@
 /* 英単語帳 Service Worker — アプリシェルをキャッシュしてオフラインで開けるようにする。
    アプリのファイルを更新したら CACHE_VERSION を上げること（古いキャッシュは activate で削除される）。 */
-var CACHE_VERSION = "v2";
+var CACHE_VERSION = "v3";
 var CACHE_NAME = "eitango-shell-" + CACHE_VERSION;
 var SHELL = [
   "./",
