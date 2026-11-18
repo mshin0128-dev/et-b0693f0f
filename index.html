@@ -257,7 +257,7 @@
       <div class="settings-row col">
         <div class="st-label" style="margin-bottom:6px;">OpenAI APIキー</div>
         <div class="st-desc" style="margin-bottom:10px;">入力テストで不正解になった問題だけ、AIに意味の妥当性を確認させます。このとき単語とあなたの回答がOpenAIに送信されます。キーは platform.openai.com で作成できます。支払い登録と、月の利用上限の設定をしておくと安心です。キーがなくてもすべての機能は動作します。</div>
-        <input type="password" id="openaiKeyInput" class="key-input" autocomplete="off" placeholder="APIキーを入力">
+        <div class="key-wrap"><input type="password" id="openaiKeyInput" class="key-input" autocomplete="off" placeholder="APIキーを入力"><button type="button" class="btn key-eye" id="openaiKeyToggleBtn" aria-label="APIキーを表示する">👁</button></div>
         <div class="btn-row" style="margin-top:0;">
           <button type="button" class="btn primary" id="openaiKeySaveBtn">保存</button>
           <button type="button" class="btn danger" id="openaiKeyDeleteBtn" style="display:none;">削除</button>
